@@ -1,9 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""
+파일 이름: GUIServer_custom.py
+용도: PiCar-Pro PC GUI 서버
+
+이번 수정
+- PC 주행 응답 개선
+- 전진/후진 속도 50, 회전 속도 40
+- YOLO 부하 추가 감소: 224 / 8프레임마다 탐지
+- 카메라 전송과 YOLO 추론 분리 유지
+- TCP_NODELAY 적용
+- 집게 지연 0.12 제거
+- 집게 시작 전 stopWiggle + sleep 제거
+"""
+
 import os
 
-# YOLO가 Raspberry Pi CPU를 과도하게 사용하는 것 방지
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
@@ -29,7 +42,7 @@ from YOLO_detector import YOLODetector
 
 
 # =========================================================
-# CPU 사용 제한
+# CPU 부하 제한
 # =========================================================
 
 try:
@@ -53,28 +66,22 @@ except Exception:
 # =========================================================
 
 HOST = ""
-
 PORT = 10223
-
 BUFSIZ = 1024
-
 VIDEO_PORT = 5555
 
 
 # =========================================================
-# 주행
+# 주행 설정
 # =========================================================
 
-speed_set = 25
+speed_set = 50
 
-TURN_SPEED = 30
-
+TURN_SPEED = 40
 TURN_ANGLE = 30
 
 Dv = -1
 
-
-# 하드웨어 명령이 동시에 실행되지 않도록 보호
 control_lock = threading.RLock()
 
 
@@ -83,12 +90,9 @@ control_lock = threading.RLock()
 # =========================================================
 
 CAMERA_WIDTH = 640
-
 CAMERA_HEIGHT = 480
-
 CAMERA_FPS = 15
-
-JPEG_QUALITY = 70
+JPEG_QUALITY = 65
 
 
 # =========================================================
@@ -96,17 +100,14 @@ JPEG_QUALITY = 70
 # =========================================================
 
 YOLO_MODEL_PATH = "yolov8n.pt"
-
 YOLO_CONFIDENCE = 0.35
 
-# 기존 320 -> 256
-YOLO_IMAGE_SIZE = 256
+YOLO_IMAGE_SIZE = 224
 
-# 기존 3 -> 5
-YOLO_DETECT_EVERY_N_FRAMES = 5
-
+YOLO_DETECT_EVERY_N_FRAMES = 8
 
 yolo_detector = None
+async_yolo = None
 
 
 # =========================================================
@@ -126,8 +127,6 @@ current_motion = "stop"
 
 GRIPPER_SPEED = 5
 
-GRIPPER_DELAY = 0.12
-
 gripper_lock = threading.Lock()
 
 
@@ -135,34 +134,22 @@ gripper_lock = threading.Lock()
 # Servo
 # =========================================================
 
-# 앞바퀴
 steering = RPIservo.ServoCtrl()
 
 steering.moveServoInit([0])
 
 
-# PC 서버에서는
-# 카메라 Servo 1을 움직이지 않는다.
-
-
-# 팔 Servo 2
 arm_servo = RPIservo.ServoCtrl()
 
 arm_servo.start()
 
 
-# 손목 Servo 3
 hand_servo = RPIservo.ServoCtrl()
 
 hand_servo.start()
 
 
-# 집게 Servo 4
 gripper_servo = RPIservo.ServoCtrl()
-
-gripper_servo.setDelay(
-    GRIPPER_DELAY
-)
 
 gripper_servo.start()
 
@@ -229,8 +216,6 @@ class AsyncYOLO:
         if self.detector is None:
             return
 
-        # YOLO가 느려도
-        # 가장 최신 프레임만 유지한다.
         with self.frame_lock:
 
             self.latest_frame = (
@@ -354,9 +339,6 @@ class AsyncYOLO:
             self.thread.join(
                 timeout=1.0
             )
-
-
-async_yolo = None
 
 
 # =========================================================
@@ -513,20 +495,6 @@ def gripper_start(
 
     with gripper_lock:
 
-        try:
-
-            gripper_servo.stopWiggle()
-
-        except Exception:
-
-            pass
-
-
-        time.sleep(
-            0.02
-        )
-
-
         gripper_servo.singleServo(
 
             4,
@@ -611,7 +579,7 @@ def safe_stop(
 
 
 # =========================================================
-# 실제 주행
+# 주행
 # =========================================================
 
 def drive_command(
@@ -636,7 +604,6 @@ def drive_command(
         )
 
 
-        # 앞바퀴 방향을 먼저 변경
         steering.moveAngle(
 
             0,
@@ -646,8 +613,6 @@ def drive_command(
         )
 
 
-        # 기존 0.05초 대기 제거
-        # 바로 모터 명령 전달
         move.move(
 
             speed,
@@ -673,7 +638,6 @@ def robot_ctrl(
 ):
 
 
-    # 전진
     if command == "forward":
 
         drive_command(
@@ -689,7 +653,6 @@ def robot_ctrl(
         )
 
 
-    # 후진
     elif command == "backward":
 
         drive_command(
@@ -705,7 +668,6 @@ def robot_ctrl(
         )
 
 
-    # 전진 좌회전
     elif command == "left":
 
         drive_command(
@@ -721,7 +683,6 @@ def robot_ctrl(
         )
 
 
-    # 전진 우회전
     elif command == "right":
 
         drive_command(
@@ -737,7 +698,6 @@ def robot_ctrl(
         )
 
 
-    # 후진 좌회전
     elif command == "backleft":
 
         drive_command(
@@ -753,7 +713,6 @@ def robot_ctrl(
         )
 
 
-    # 후진 우회전
     elif command == "backright":
 
         drive_command(
@@ -769,7 +728,6 @@ def robot_ctrl(
         )
 
 
-    # 이동 정지
     elif command in (
         "DS",
         "TS"
@@ -780,19 +738,16 @@ def robot_ctrl(
         )
 
 
-    # 라이트 ON
     elif command == "light_on":
 
         light_on_mode()
 
 
-    # 라이트 OFF
     elif command == "light_off":
 
         light_off_mode()
 
 
-    # 카메라 목 고정
     elif command in (
 
         "lookleft",
@@ -804,7 +759,6 @@ def robot_ctrl(
         pass
 
 
-    # 팔 위
     elif command == "armup":
 
         arm_servo.singleServo(
@@ -816,7 +770,6 @@ def robot_ctrl(
         )
 
 
-    # 팔 아래
     elif command == "armdown":
 
         arm_servo.singleServo(
@@ -828,13 +781,11 @@ def robot_ctrl(
         )
 
 
-    # 팔 정지
     elif command == "armstop":
 
         arm_servo.stopWiggle()
 
 
-    # 손목 위
     elif command == "handup":
 
         hand_servo.singleServo(
@@ -846,7 +797,6 @@ def robot_ctrl(
         )
 
 
-    # 손목 아래
     elif command == "handdown":
 
         hand_servo.singleServo(
@@ -858,13 +808,11 @@ def robot_ctrl(
         )
 
 
-    # 손목 정지
     elif command == "HAstop":
 
         hand_servo.stopWiggle()
 
 
-    # 집게 잡기
     elif command == "grab":
 
         gripper_start(
@@ -872,7 +820,6 @@ def robot_ctrl(
         )
 
 
-    # 집게 놓기
     elif command == "loose":
 
         gripper_start(
@@ -880,13 +827,11 @@ def robot_ctrl(
         )
 
 
-    # 집게 정지
     elif command == "stop":
 
         gripper_stop()
 
 
-    # 팔 초기 위치
     elif command == "home":
 
         arm_servo.moveServoInit(
@@ -922,7 +867,11 @@ def camera_stream(
 
 
     frame_interval = (
-        1.0 / CAMERA_FPS
+
+        1.0
+        /
+        CAMERA_FPS
+
     )
 
 
@@ -934,9 +883,11 @@ def camera_stream(
 
 
         footage_socket = (
+
             context.socket(
                 zmq.PAIR
             )
+
         )
 
 
@@ -949,8 +900,6 @@ def camera_stream(
         )
 
 
-        # 오래된 영상이 쌓이지 않도록
-        # Queue 1개만 사용
         footage_socket.setsockopt(
 
             zmq.SNDHWM,
@@ -973,6 +922,7 @@ def camera_stream(
 
 
         config = (
+
             camera
             .create_preview_configuration(
 
@@ -982,13 +932,17 @@ def camera_stream(
                         "RGB888",
 
                     "size": (
+
                         CAMERA_WIDTH,
+
                         CAMERA_HEIGHT
+
                     )
 
                 }
 
             )
+
         )
 
 
@@ -1008,6 +962,7 @@ def camera_stream(
         print(
 
             f"[카메라] "
+
             f"{client_ip}:"
             f"{VIDEO_PORT} "
 
@@ -1044,6 +999,7 @@ def camera_stream(
 
 
             frame_bgr = (
+
                 cv2.cvtColor(
 
                     frame,
@@ -1051,14 +1007,13 @@ def camera_stream(
                     cv2.COLOR_RGB2BGR
 
                 )
+
             )
 
 
             frame_count += 1
 
 
-            # 5프레임마다
-            # YOLO Thread에 최신 프레임 전달
             if (
 
                 async_yolo
@@ -1086,18 +1041,19 @@ def camera_stream(
                 )
 
 
-            # 기존 YOLO 결과는
-            # 카메라에 즉시 표시
             if async_yolo is not None:
 
                 frame_bgr = (
+
                     async_yolo.draw(
                         frame_bgr
                     )
+
                 )
 
 
             ok, encoded = (
+
                 cv2.imencode(
 
                     ".jpg",
@@ -1115,17 +1071,23 @@ def camera_stream(
                     ]
 
                 )
+
             )
 
 
             if not ok:
+
                 continue
 
 
             jpg_text = (
+
                 base64.b64encode(
+
                     encoded.tobytes()
+
                 )
+
             )
 
 
@@ -1142,12 +1104,9 @@ def camera_stream(
 
             except zmq.Again:
 
-                # GUI가 느리면
-                # 오래된 프레임 버림
                 pass
 
 
-            # 약 15FPS 유지
             elapsed = (
 
                 time.monotonic()
@@ -1185,7 +1144,6 @@ def camera_stream(
 
 
     finally:
-
 
         if camera is not None:
 
@@ -1251,6 +1209,23 @@ def handle_client(
     )
 
 
+    try:
+
+        client_socket.setsockopt(
+
+            socket.IPPROTO_TCP,
+
+            socket.TCP_NODELAY,
+
+            1
+
+        )
+
+    except Exception:
+
+        pass
+
+
     camera_stop_event = (
         threading.Event()
     )
@@ -1266,6 +1241,7 @@ def handle_client(
 
 
     camera_thread = (
+
         threading.Thread(
 
             target=camera_stream,
@@ -1283,6 +1259,7 @@ def handle_client(
             name="CameraStreamThread"
 
         )
+
     )
 
 
@@ -1296,13 +1273,16 @@ def handle_client(
 
 
             raw = (
+
                 client_socket.recv(
                     BUFSIZ
                 )
+
             )
 
 
             if not raw:
+
                 break
 
 
@@ -1318,6 +1298,7 @@ def handle_client(
 
 
             if not command:
+
                 continue
 
 
@@ -1438,8 +1419,11 @@ def handle_client(
     except Exception as e:
 
         print(
+
             "[클라이언트 오류]",
+
             repr(e)
+
         )
 
 
@@ -1498,30 +1482,45 @@ def main():
 
     print(
 
-        f"CAMERA : "
+        f"DRIVE SPEED : "
+        f"{speed_set}"
+
+    )
+
+    print(
+
+        f"TURN SPEED  : "
+        f"{TURN_SPEED}"
+
+    )
+
+    print(
+
+        f"CAMERA      : "
+
         f"{CAMERA_WIDTH}x"
         f"{CAMERA_HEIGHT} "
+
         f"{CAMERA_FPS}FPS"
 
     )
 
     print(
 
-        f"YOLO   : "
+        f"YOLO        : "
+
         f"{YOLO_MODEL_PATH}, "
-        f"imgsz={YOLO_IMAGE_SIZE}, "
+
+        f"imgsz="
+        f"{YOLO_IMAGE_SIZE}, "
+
         f"every="
         f"{YOLO_DETECT_EVERY_N_FRAMES}"
 
     )
 
     print(
-        "TORCH  : 1 CPU Thread"
-    )
-
-    print(
-        "조향 중앙값: "
-        "RPIservo.py init_pwm0 사용"
+        "GRIPPER     : 기본 delay 사용"
     )
 
     print(
@@ -1529,7 +1528,6 @@ def main():
     )
 
 
-    # OLED
     oled_eyes = OLEDEyes(
 
         port=1,
@@ -1548,11 +1546,11 @@ def main():
         )
 
 
-    # YOLO
     try:
 
 
         yolo_detector = (
+
             YOLODetector(
 
                 model_path=
@@ -1564,18 +1562,20 @@ def main():
                 imgsz=
                     YOLO_IMAGE_SIZE,
 
-                # 서버에서
-                # 프레임 주기를 관리하므로 1
-                detect_every_n_frames=1
+                detect_every_n_frames=
+                    1
 
             )
+
         )
 
 
         async_yolo = (
+
             AsyncYOLO(
                 yolo_detector
             )
+
         )
 
 
@@ -1602,16 +1602,15 @@ def main():
         print(
 
             "[YOLO] 객체 탐지 없이 "
+
             "카메라만 실행합니다."
 
         )
 
 
-    # 모터
     move.setup()
 
 
-    # 라이트
     try:
 
         switch.switchSetup()
@@ -1632,6 +1631,7 @@ def main():
 
 
     server_socket = (
+
         socket.socket(
 
             socket.AF_INET,
@@ -1639,6 +1639,7 @@ def main():
             socket.SOCK_STREAM
 
         )
+
     )
 
 
@@ -1671,6 +1672,7 @@ def main():
     print(
 
         f"[서버] PORT "
+
         f"{PORT}에서 연결 대기"
 
     )
@@ -1683,7 +1685,9 @@ def main():
 
 
             client_socket, client_address = (
+
                 server_socket.accept()
+
             )
 
 
