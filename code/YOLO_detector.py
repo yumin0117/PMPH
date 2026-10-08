@@ -23,8 +23,8 @@ class YOLODetector:
         self,
         model_path="yolov8n.pt",
         confidence=0.35,
-        imgsz=320,
-        detect_every_n_frames=3,
+        imgsz=256,
+        detect_every_n_frames=5,
     ):
         self.model_path = model_path
         self.confidence = confidence

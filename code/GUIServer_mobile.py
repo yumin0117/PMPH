@@ -1,50 +1,18 @@
 #!/usr/bin/env python3
-
 # -*- coding: utf-8 -*-
 
-"""
-
-=========================================================
-
-파일 이름 : GUIServer_mobile.py
-
-용도      : PiCar-Pro 핸드폰 전용 웹 GUI 서버
-
-=========================================================
-
-실행:
-
-    cd ~/Adeept_PiCar-Pro/Server
-
-    sudo python3 GUIServer_mobile.py
-
-핸드폰 접속:
-
-    http://라즈베리파이IP:5000
-
-예:
-
-    http://192.168.25.112:5000
-
-주의:
-
-- PC용 GUIServer_custom.py와 동시에 실행하지 않는다.
-
-- PC GUI를 사용할 때는 GUIServer_custom.py 사용
-
-- 모바일 GUI를 사용할 때는 GUIServer_mobile.py 사용
-
-"""
+import os
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
 
 import json
-import socket
 import threading
 import time
-
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import cv2
-
+import torch
 from picamera2 import Picamera2
 
 import Move as move
@@ -54,18 +22,177 @@ import Switch as switch
 from OLED_eyes import OLEDEyes
 from YOLO_detector import YOLODetector
 
-# =========================================================
-
-# OLED 눈동자 모듈
 
 # =========================================================
+# CPU 부하 제한
+# =========================================================
 
-# OLED_eyes.py에서 실제 OLED 그림/애니메이션을 담당한다.
-# 이 서버는 현재 이동 방향만 전달한다.
+try:
+    torch.set_num_threads(1)
+except Exception:
+    pass
+
+try:
+    torch.set_num_interop_threads(1)
+except Exception:
+    pass
+
+try:
+    cv2.setNumThreads(1)
+except Exception:
+    pass
+
+
+# =========================================================
+# 기본 설정
+# =========================================================
+
+HOST = "0.0.0.0"
+WEB_PORT = 5000
+
+DRIVE_SPEED = 60
+TURN_SPEED = 50
+TURN_ANGLE = 30
+Dv = -1
+
+CAMERA_FIXED_ANGLE = 90
+CAMERA_WIDTH = 640
+CAMERA_HEIGHT = 480
+CAMERA_FPS = 15
+JPEG_QUALITY = 65
+
+YOLO_MODEL_PATH = "yolov8n.pt"
+YOLO_CONFIDENCE = 0.35
+YOLO_IMAGE_SIZE = 256
+YOLO_DETECT_EVERY_N_FRAMES = 5
+
+GRIPPER_SPEED = 5
+GRIPPER_DELAY = 0.12
+
+
+# =========================================================
+# 프로그램 상태
+# =========================================================
+
+server_running = True
+light_always_on = False
+current_motion = "stop"
+
 oled_eyes = None
-
-# YOLO 객체 탐지 모듈
 yolo_detector = None
+async_yolo = None
+
+latest_jpeg = None
+latest_frame_id = 0
+
+control_lock = threading.RLock()
+gripper_lock = threading.Lock()
+camera_condition = threading.Condition()
+
+last_move_seq = -1
+move_seq_lock = threading.Lock()
+
+
+# =========================================================
+# Servo
+# =========================================================
+
+steering = RPIservo.ServoCtrl()
+camera_servo = RPIservo.ServoCtrl()
+gripper_servo = RPIservo.ServoCtrl()
+
+
+# =========================================================
+# 비동기 YOLO
+# =========================================================
+
+class AsyncYOLO:
+    def __init__(self, detector):
+        self.detector = detector
+        self.frame_lock = threading.Lock()
+        self.result_lock = threading.Lock()
+        self.event = threading.Event()
+        self.stop_event = threading.Event()
+        self.latest_frame = None
+        self.latest_detections = []
+        self.thread = None
+
+    def start(self):
+        if self.detector is None:
+            return
+
+        self.thread = threading.Thread(
+            target=self._worker,
+            daemon=True,
+            name="YOLOWorker"
+        )
+        self.thread.start()
+
+    def submit(self, frame):
+        if self.detector is None:
+            return
+
+        with self.frame_lock:
+            self.latest_frame = frame.copy()
+
+        self.event.set()
+
+    def draw(self, frame):
+        if self.detector is None:
+            return frame
+
+        with self.result_lock:
+            detections = list(self.latest_detections)
+
+        try:
+            return self.detector._draw_detections(frame, detections)
+        except Exception as e:
+            print("[YOLO] 표시 오류:", repr(e))
+            return frame
+
+    def _worker(self):
+        print("[YOLO] 비동기 탐지 Thread 시작")
+
+        while not self.stop_event.is_set():
+            self.event.wait(timeout=0.2)
+
+            if self.stop_event.is_set():
+                break
+
+            if not self.event.is_set():
+                continue
+
+            self.event.clear()
+
+            with self.frame_lock:
+                if self.latest_frame is None:
+                    continue
+
+                frame = self.latest_frame.copy()
+
+            try:
+                detections = self.detector._run_inference(frame)
+
+                with self.result_lock:
+                    self.latest_detections = detections
+
+            except Exception as e:
+                print("[YOLO] 탐지 오류:", repr(e))
+                time.sleep(0.05)
+
+        print("[YOLO] 비동기 탐지 Thread 종료")
+
+    def stop(self):
+        self.stop_event.set()
+        self.event.set()
+
+        if self.thread is not None and self.thread.is_alive():
+            self.thread.join(timeout=1.0)
+
+
+# =========================================================
+# OLED / Servo 초기화
+# =========================================================
 
 def oled_set_direction(direction):
     if oled_eyes is None:
@@ -76,1743 +203,1082 @@ def oled_set_direction(direction):
     except Exception as e:
         print("[OLED] 방향 전달 오류:", e)
 
-# =========================================================
-
-# 주행 설정
-
-# =========================================================
-
-DRIVE_SPEED = 60
-
-TURN_SPEED = 50
-
-TURN_ANGLE = 30
-
-# Adeept 공식 방향값
-
-Dv = -1
-
-# =========================================================
-
-# 카메라 목 고정 각도
-
-# =========================================================
-
-# Servo 1 = 카메라 목
-
-# 프로그램이 시작되면 이 위치로 한 번 이동한 뒤
-# 이후에는 카메라 목을 움직이지 않는다.
-
-# 카메라가 바닥을 보면:
-
-# 90 -> 80 -> 70
-# 으로 테스트.
-
-# 반대로 움직이면:
-
-# 90 -> 100 -> 110
-# 으로 테스트.
-
-# =========================================================
-
-CAMERA_FIXED_ANGLE = 90
-
-# =========================================================
-
-# 카메라 영상 설정
-
-# =========================================================
-
-CAMERA_WIDTH = 640
-
-CAMERA_HEIGHT = 480
-
-CAMERA_FPS = 15
-
-JPEG_QUALITY = 70
-
-# =========================================================
-
-# YOLO 객체 탐지 설정
-
-# =========================================================
-
-YOLO_MODEL_PATH = "yolov8n.pt"
-YOLO_CONFIDENCE = 0.35
-YOLO_IMAGE_SIZE = 320
-YOLO_DETECT_EVERY_N_FRAMES = 3
-
-# =========================================================
-
-# 프로그램 상태
-
-# =========================================================
-
-server_running = True
-
-# LIGHT ON 여부
-
-light_always_on = False
-
-# 현재 이동 방향
-
-current_motion = "stop"
-
-# PC/핸드폰 요청이 겹쳐도 하드웨어 명령을
-# 한 번에 하나씩 처리하기 위한 Lock
-
-control_lock = threading.RLock()
-
-# =========================================================
-
-# 카메라 공유 데이터
-
-# =========================================================
-
-latest_jpeg = None
-
-latest_frame_id = 0
-
-# 새 프레임이 들어왔다는 것을
-# 영상 전송 Thread에 알려주기 위해 사용
-
-camera_condition = threading.Condition()
-
-# =========================================================
-
-# Servo 객체
-
-# =========================================================
-
-# Servo 0
-
-# 앞바퀴 조향
-
-steering = RPIservo.ServoCtrl()
-
-# Servo 1
-
-# 카메라 목
-
-camera_servo = RPIservo.ServoCtrl()
-
-# Servo 4
-
-# 집게
-
-gripper_servo = RPIservo.ServoCtrl()
-
-# =========================================================
-
-# Servo 초기화
-
-# =========================================================
 
 def initialize_servos():
-
-    # -----------------------------------------------------
-
-    # 앞바퀴 조향
-
-    # RPIservo.py의 init_pwm0 값을 중앙으로 사용한다.
-
-    # 현재
-    # init_pwm0 = 60
-    # 으로 맞춰놓은 상태.
-
-    # -----------------------------------------------------
-
     steering.moveServoInit([0])
+    camera_servo.set_angle(1, CAMERA_FIXED_ANGLE)
 
-    # -----------------------------------------------------
-
-    # 카메라 목
-
-    # 시작할 때 한 번만 정면 위치로 이동시킨다.
-
-    # 여기서는 moveInit()을 사용하지 않는다.
-
-    # moveInit()을 사용하면 다른 Servo까지 같이
-
-    # 초기화될 수 있기 때문이다.
-
-    # -----------------------------------------------------
-
-    camera_servo.set_angle(
-
-        1,
-
-        CAMERA_FIXED_ANGLE
-
-    )
-
-    # -----------------------------------------------------
-
-    # 집게 제어 Thread
-
-    # -----------------------------------------------------
-
+    gripper_servo.setDelay(GRIPPER_DELAY)
     gripper_servo.start()
 
-    print(
+    print(f"[카메라 목] Servo 1 = {CAMERA_FIXED_ANGLE}도 고정")
 
-        f"[카메라 목] Servo 1 = "
-        
-        f"{CAMERA_FIXED_ANGLE}도 고정"
-
-    )
 
 # =========================================================
+# 집게
+# =========================================================
 
-# 라이트 기본 함수
+def gripper_start(direction):
+    with gripper_lock:
+        try:
+            gripper_servo.stopWiggle()
+        except Exception:
+            pass
 
+        time.sleep(0.02)
+
+        gripper_servo.singleServo(
+            4,
+            direction,
+            GRIPPER_SPEED
+        )
+
+
+def gripper_stop():
+    with gripper_lock:
+        try:
+            gripper_servo.stopWiggle()
+        except Exception:
+            pass
+
+
+# =========================================================
+# 라이트
 # =========================================================
 
 def both_lights_on():
+    switch.switch(1, 1)
+    switch.switch(2, 1)
 
-    switch.switch(
-
-        1,
-
-        1
-
-    )
-
-    switch.switch(
-
-        2,
-
-        1
-
-    )
 
 def both_lights_off():
+    switch.switch(1, 0)
+    switch.switch(2, 0)
 
-    switch.switch(
 
-        1,
-
-        0
-
-    )
-
-    switch.switch(
-
-        2,
-
-        0
-
-    )
-
-# =========================================================
-
-# 현재 움직임에 따라 라이트 적용
-
-# =========================================================
-
-def apply_motion_lights(
-
-    motion=None
-
-):
-
+def apply_motion_lights(motion=None):
     if motion is None:
-
         motion = current_motion
 
-    # =====================================================
-
-    # LIGHT ON 모드
-
-    # 이동 방향에 관계없이
-
-    # 두 라이트를 계속 켜둔다.
-
-    # =====================================================
-
     if light_always_on:
-
         both_lights_on()
-
         return
 
-    # =====================================================
-
-    # 자동 모드
-
-    # =====================================================
-
-    # 전진 / 후진
-
-    # -> 양쪽 ON
-
-    if motion in (
-
-        "forward",
-
-        "backward"
-
-    ):
-
+    if motion in ("forward", "backward"):
         both_lights_on()
 
-    # 왼쪽
+    elif motion in ("left", "backleft"):
+        switch.switch(1, 1)
+        switch.switch(2, 0)
 
-    # -> 왼쪽만 ON
-
-    elif motion in (
-
-        "left",
-
-        "backleft"
-
-    ):
-
-        switch.switch(
-
-            1,
-
-            1
-
-        )
-
-        switch.switch(
-
-            2,
-
-            0
-
-        )
-
-    # 오른쪽
-
-    # -> 오른쪽만 ON
-
-    elif motion in (
-
-        "right",
-
-        "backright"
-
-    ):
-
-        switch.switch(
-
-            1,
-
-            0
-
-        )
-
-        switch.switch(
-
-            2,
-
-            1
-
-        )
-
-    # 정지
-    # -> OFF
+    elif motion in ("right", "backright"):
+        switch.switch(1, 0)
+        switch.switch(2, 1)
 
     else:
         both_lights_off()
 
-# =========================================================
-
-# LIGHT ON
-
-# =========================================================
 
 def light_on_mode():
-
     global light_always_on
 
     light_always_on = True
-
     both_lights_on()
 
-    print(
+    print("[라이트] 항상 ON")
 
-        "[라이트] 항상 ON"
-
-    )
-
-# =========================================================
-
-# LIGHT OFF
-
-# 실제 의미:
-
-# 자동 라이트 모드로 복귀
-
-# =========================================================
 
 def light_off_mode():
-
     global light_always_on
 
     light_always_on = False
+    apply_motion_lights(current_motion)
 
-    apply_motion_lights(
+    print("[라이트] 자동 모드")
 
-        current_motion
-
-    )
-
-    print(
-
-        "[라이트] 자동 모드"
-
-    )
 
 # =========================================================
-
-# 안전 정지
-
+# 주행
 # =========================================================
 
-def safe_stop(
-
-    force_lights_off=False
-
-):
-
+def safe_stop(force_lights_off=False):
     global current_motion
 
     with control_lock:
-
-        # -------------------------------------------------
-
-        # 모터 정지
-
-        # -------------------------------------------------
-
         try:
             move.motorStop()
-
         except Exception:
             pass
 
-        # -------------------------------------------------
-
-        # 앞바퀴 중앙
-
-        # moveAngle(0, 0)은
-
-        # 실제 0도가 아니라 init_pwm0 기준 중앙이다.
-
-        # init_pwm0 = 60이면
-
-        # 실제 60도로 돌아간다.
-
-        # -------------------------------------------------
-
         try:
-
-            steering.moveAngle(
-                0,
-                0
-            )
-
+            steering.moveAngle(0, 0)
         except Exception:
-
             pass
 
         current_motion = "stop"
-
         oled_set_direction("stop")
 
-        # -------------------------------------------------
-
-        # 라이트
-
-        # -------------------------------------------------
-
         try:
-
             if force_lights_off:
                 both_lights_off()
-
             else:
-                apply_motion_lights(
-                    "stop"
-                )
-
+                apply_motion_lights("stop")
         except Exception:
-
             pass
 
-# =========================================================
 
-# 로봇 명령 처리
-
-# =========================================================
-
-def robot_ctrl(
-
-    command
-
-):
-
+def drive_command(motion, direction, steering_offset, speed):
     global current_motion
 
     with control_lock:
+        current_motion = motion
+
+        oled_set_direction(motion)
+
+        steering.moveAngle(
+            0,
+            steering_offset
+        )
+
+        move.move(
+            speed,
+            direction,
+            "mid"
+        )
+
+        apply_motion_lights(motion)
+
+
+def robot_ctrl(command):
+    if command == "forward":
+        drive_command(
+            "forward",
+            1,
+            0,
+            DRIVE_SPEED
+        )
+
+    elif command == "backward":
+        drive_command(
+            "backward",
+            -1,
+            0,
+            DRIVE_SPEED
+        )
+
+    elif command == "left":
+        drive_command(
+            "left",
+            1,
+            TURN_ANGLE * Dv,
+            TURN_SPEED
+        )
+
+    elif command == "right":
+        drive_command(
+            "right",
+            1,
+            -TURN_ANGLE * Dv,
+            TURN_SPEED
+        )
+
+    elif command == "backleft":
+        drive_command(
+            "backleft",
+            -1,
+            TURN_ANGLE * Dv,
+            TURN_SPEED
+        )
+
+    elif command == "backright":
+        drive_command(
+            "backright",
+            -1,
+            -TURN_ANGLE * Dv,
+            TURN_SPEED
+        )
+
+    elif command == "stop_move":
+        safe_stop(
+            force_lights_off=False
+        )
+
+    elif command == "light_on":
+        light_on_mode()
+
+    elif command == "light_off":
+        light_off_mode()
+
+    elif command == "grab":
+        gripper_start(-1)
+
+    elif command == "loose":
+        gripper_start(1)
+
+    elif command == "grip_stop":
+        gripper_stop()
+
+    elif command in (
+        "lookleft",
+        "lookright",
+        "lookup",
+        "lookdown",
+        "LRstop",
+        "UDstop"
+    ):
+        pass
+
+    else:
+        raise ValueError(
+            f"알 수 없는 명령: {command}"
+        )
 
-        # =================================================
-
-        # 전진
-
-        # =================================================
-
-        if command == "forward":
-
-            current_motion = "forward"
-
-            oled_set_direction("forward")
-
-            steering.moveAngle(
-
-                0,
-
-                0
-
-            )
-
-            move.move(
-
-                DRIVE_SPEED,
-
-                1,
-
-                "mid"
-
-            )
-
-            apply_motion_lights(
-
-                current_motion
-
-            )
-
-        # =================================================
-
-        # 후진
-
-        # =================================================
-
-        elif command == "backward":
-
-            current_motion = "backward"
-
-            oled_set_direction("backward")
-
-            steering.moveAngle(
-
-                0,
-
-                0
-
-            )
-
-            move.move(
-
-                DRIVE_SPEED,
-
-                -1,
-
-                "mid"
-
-            )
-
-            apply_motion_lights(
-
-                current_motion
-
-            )
-
-        # =================================================
-
-        # 전진 좌회전
-
-        # =================================================
-
-        elif command == "left":
-
-            current_motion = "left"
-
-            oled_set_direction("left")
-
-            steering.moveAngle(
-
-                0,
-
-                TURN_ANGLE * Dv
-
-            )
-
-            time.sleep(
-
-                0.05
-
-            )
-
-            move.move(
-
-                TURN_SPEED,
-
-                1,
-
-                "mid"
-
-            )
-
-            apply_motion_lights(
-
-                current_motion
-
-            )
-
-        # =================================================
-
-        # 전진 우회전
-
-        # =================================================
-
-        elif command == "right":
-
-            current_motion = "right"
-
-            oled_set_direction("right")
-
-            steering.moveAngle(
-
-                0,
-
-                -TURN_ANGLE * Dv
-
-            )
-
-            time.sleep(
-
-                0.05
-
-            )
-
-            move.move(
-
-                TURN_SPEED,
-
-                1,
-
-                "mid"
-
-            )
-
-            apply_motion_lights(
-
-                current_motion
-
-            )
-
-        # =================================================
-
-        # 후진 좌회전
-
-        # =================================================
-
-        elif command == "backleft":
-
-            current_motion = "backleft"
-
-            oled_set_direction("backleft")
-
-            steering.moveAngle(
-
-                0,
-
-                TURN_ANGLE * Dv
-
-            )
-
-            time.sleep(
-
-                0.05
-
-            )
-
-            move.move(
-
-                TURN_SPEED,
-
-                -1,
-
-                "mid"
-
-            )
-
-            apply_motion_lights(
-
-                current_motion
-
-            )
-
-        # =================================================
-
-        # 후진 우회전
-
-        # =================================================
-
-        elif command == "backright":
-
-            current_motion = "backright"
-
-            oled_set_direction("backright")
-
-            steering.moveAngle(
-
-                0,
-
-                -TURN_ANGLE * Dv
-
-            )
-
-            time.sleep(
-
-                0.05
-
-            )
-
-            move.move(
-
-                TURN_SPEED,
-
-                -1,
-
-                "mid"
-
-            )
-
-            apply_motion_lights(
-
-                current_motion
-
-            )
-
-        # =================================================
-
-        # 이동 정지
-
-        # =================================================
-
-        elif command == "stop_move":
-
-            safe_stop(
-
-                force_lights_off=False
-
-            )
-
-        # =================================================
-
-        # LIGHT ON
-
-        # =================================================
-
-        elif command == "light_on":
-
-            light_on_mode()
-
-        # =================================================
-
-        # LIGHT OFF
-
-        #
-
-        # 자동 모드로 돌아감
-
-        # =================================================
-
-        elif command == "light_off":
-
-            light_off_mode()
-
-        # =================================================
-
-        # 집게 잡기
-
-        # =================================================
-
-        elif command == "grab":
-
-            gripper_servo.singleServo(
-
-                4,
-
-                -1,
-
-                5
-
-            )
-
-        # =================================================
-
-        # 집게 놓기
-
-        # =================================================
-
-        elif command == "loose":
-
-            gripper_servo.singleServo(
-
-                4,
-
-                1,
-
-                5
-
-            )
-
-        # =================================================
-
-        # 집게 정지
-
-        # =================================================
-
-        elif command == "grip_stop":
-
-            gripper_servo.stopWiggle()
-
-        # =================================================
-
-        # 카메라 Servo
-
-        #
-
-        # 지금은 어떤 명령이 들어와도 움직이지 않는다.
-
-        # 센서 추가 후 이 부분에 추적 기능을 넣으면 됨.
-
-        # =================================================
-
-        elif command in (
-
-            "lookleft",
-
-            "lookright",
-
-            "lookup",
-
-            "lookdown",
-
-            "LRstop",
-
-            "UDstop"
-
-        ):
-
-            pass
-
-        else:
-
-            raise ValueError(
-
-                f"알 수 없는 명령: {command}"
-
-            )
 
 # =========================================================
-
-# 카메라 캡처 Thread
-
+# 카메라
 # =========================================================
 
 def camera_worker():
-
     global latest_jpeg
-
-    global yolo_detector
-
     global latest_frame_id
 
     camera = None
+    frame_count = 0
+    frame_interval = 1.0 / CAMERA_FPS
 
     try:
-
-        # -------------------------------------------------
-
-        # Picamera2 생성
-
-        # -------------------------------------------------
-
         camera = Picamera2()
 
-        # -------------------------------------------------
-
-        # 영상용 configuration
-
-        #
-
-        # preview가 아니라 video configuration 사용
-
-        # -------------------------------------------------
-
-        # 기존에 정상 동작하던 모바일 카메라 설정을 그대로 사용한다.
-        # FrameRate 제어를 강제로 넣으면 일부 libcamera 환경에서
-        # FrameDurationLimits 오류가 발생하므로 사용하지 않는다.
         config = camera.create_preview_configuration(
             main={
                 "format": "RGB888",
-                "size": (CAMERA_WIDTH, CAMERA_HEIGHT),
+                "size": (
+                    CAMERA_WIDTH,
+                    CAMERA_HEIGHT
+                ),
             }
         )
 
-        camera.configure(
-
-            config
-
-        )
-
+        camera.configure(config)
         camera.start()
 
-        # 카메라가 안정화될 시간
-
-        time.sleep(
-
-            1.0
-
-        )
+        time.sleep(1.0)
 
         print(
-
-            "[카메라] 실시간 영상 시작"
-
+            f"[카메라] 실시간 영상 시작 "
+            f"{CAMERA_WIDTH}x{CAMERA_HEIGHT} "
+            f"{CAMERA_FPS}FPS"
         )
 
-        # -------------------------------------------------
-
-        # 계속 프레임 읽기
-
-        # -------------------------------------------------
-
         while server_running:
+            loop_start = time.monotonic()
 
-            frame = (
-
-                camera.capture_array()
-
-            )
+            frame = camera.capture_array()
 
             if frame is None:
-
-                time.sleep(
-
-                    0.01
-
-                )
-
+                time.sleep(0.01)
                 continue
 
-            # -------------------------------------------------
-
-            # Picamera2 RGB -> OpenCV BGR
-
-            # -------------------------------------------------
-
             frame_bgr = cv2.cvtColor(
-
                 frame,
-
                 cv2.COLOR_RGB2BGR
-
             )
 
-            # -------------------------------------------------
-            # YOLO 객체 탐지 + 사각형 표시
-            # -------------------------------------------------
+            frame_count += 1
 
-            if yolo_detector is not None:
-                frame_bgr = yolo_detector.detect_and_draw(
+            if (
+                async_yolo is not None
+                and
+                (
+                    frame_count == 1
+                    or
+                    frame_count
+                    %
+                    YOLO_DETECT_EVERY_N_FRAMES
+                    == 0
+                )
+            ):
+                async_yolo.submit(
                     frame_bgr
                 )
 
-            # -------------------------------------------------
-
-            # JPEG 압축
-
-            # -------------------------------------------------
+            if async_yolo is not None:
+                frame_bgr = async_yolo.draw(
+                    frame_bgr
+                )
 
             ok, encoded = cv2.imencode(
-
                 ".jpg",
-
                 frame_bgr,
-
                 [
-
                     int(
-
                         cv2.IMWRITE_JPEG_QUALITY
-
                     ),
-
                     JPEG_QUALITY
-
                 ]
-
             )
 
-            if not ok:
+            if ok:
+                with camera_condition:
+                    latest_jpeg = (
+                        encoded.tobytes()
+                    )
 
-                continue
+                    latest_frame_id += 1
+                    camera_condition.notify_all()
 
-            jpeg = (
-
-                encoded.tobytes()
-
+            elapsed = (
+                time.monotonic()
+                -
+                loop_start
             )
 
-            # -------------------------------------------------
+            remaining = (
+                frame_interval
+                -
+                elapsed
+            )
 
-            # 새 프레임 저장
-
-            # -------------------------------------------------
-
-            with camera_condition:
-
-                latest_jpeg = jpeg
-
-                latest_frame_id += 1
-
-                # video_feed Thread에
-
-                # 새 프레임이 들어왔다고 알림
-
-                camera_condition.notify_all()
+            if remaining > 0:
+                time.sleep(
+                    remaining
+                )
 
     except Exception as e:
-
         print(
-
             "[카메라 오류]",
-
             repr(e)
-
         )
 
     finally:
-
-        # -------------------------------------------------
-
-        # 카메라 종료
-
-        # -------------------------------------------------
-
         if camera is not None:
-
             try:
-
                 camera.stop()
-
             except Exception:
-
                 pass
 
             try:
-
                 camera.close()
-
             except Exception:
-
                 pass
 
         print(
-
             "[카메라] 종료"
-
         )
 
+
 # =========================================================
-
-# 모바일 웹 페이지
-
+# 모바일 GUI
 # =========================================================
 
 MOBILE_HTML = r"""
-
 <!DOCTYPE html>
-
 <html lang="ko">
 
 <head>
-
 <meta charset="UTF-8">
 
 <meta
-
     name="viewport"
-
     content="
-
         width=device-width,
-
         initial-scale=1,
-
         maximum-scale=1,
-
         user-scalable=no
-
     "
-
 >
 
 <title>
-
 PiCar-Pro Mobile
-
 </title>
 
 <style>
 
 :root {
-
     --bg: #f4f6f8;
-
     --white: #ffffff;
-
     --text: #191f28;
-
     --sub: #8b95a1;
-
     --border: #e5e8eb;
 
     --blue: #3182f6;
-
     --blue-light: #eaf2ff;
 
     --green: #20a06b;
-
     --green-light: #e8f7f0;
 
-    --red: #e34d59;
+    --camera: #171a1f;
 
-    --red-light: #fdecee;
-
-    --camera-bg: #171a1f;
-
+    --joy-base: #505050;
+    --joy-line: #c6c6c6;
+    --joy-knob: #9b9b9b;
 }
 
 * {
-
     box-sizing: border-box;
-
-    -webkit-tap-highlight-color:
-
-        transparent;
-
+    -webkit-tap-highlight-color: transparent;
 }
 
 html,
-
 body {
-
     margin: 0;
 
     background:
-
         var(--bg);
 
     color:
-
         var(--text);
 
     font-family:
-
         -apple-system,
-
         BlinkMacSystemFont,
-
         "Segoe UI",
-
         "Noto Sans KR",
-
         sans-serif;
-
 }
 
 body {
-
     padding: 14px;
 
     padding-top:
-
         max(
-
             14px,
-
             env(safe-area-inset-top)
-
         );
 
     padding-bottom:
-
         max(
-
             20px,
-
             env(safe-area-inset-bottom)
-
         );
-
 }
 
 .app {
-
     width: 100%;
-
     max-width: 520px;
-
     margin: 0 auto;
-
 }
 
 .header {
-
     display: flex;
 
     justify-content:
-
         space-between;
 
     align-items:
-
         center;
 
     gap: 10px;
 
-    margin-bottom: 14px;
-
+    margin-bottom:
+        14px;
 }
 
 .title {
-
     font-size: 23px;
-
     font-weight: 800;
-
 }
 
 .subtitle {
-
     margin-top: 3px;
 
     color:
-
         var(--sub);
 
     font-size: 12px;
-
 }
 
 .server {
-
-    flex-shrink: 0;
-
-    padding:
-
-        8px 11px;
+    padding: 8px 11px;
 
     background:
-
         var(--white);
 
     border:
-
         1px solid
-
         var(--border);
 
     border-radius:
-
         12px;
 
     font-size: 12px;
-
 }
 
 .dot {
-
-    display:
-
-        inline-block;
+    display: inline-block;
 
     width: 8px;
-
     height: 8px;
 
     margin-right: 5px;
 
     background:
-
         var(--green);
 
-    border-radius:
-
-        50%;
-
+    border-radius: 50%;
 }
 
 .card {
-
     margin-bottom: 12px;
-
     padding: 14px;
 
     background:
-
         var(--white);
 
     border:
-
         1px solid
-
         var(--border);
 
-    border-radius:
-
-        18px;
-
+    border-radius: 18px;
 }
 
 .card-title {
-
     margin-bottom: 10px;
 
     font-size: 15px;
-
     font-weight: 800;
+}
 
+.card-title-row {
+    display: flex;
+
+    align-items:
+        center;
+
+    justify-content:
+        space-between;
+
+    gap: 10px;
+
+    margin-bottom:
+        10px;
+}
+
+.card-title-row
+.card-title {
+    margin-bottom: 0;
 }
 
 .camera-box {
-
     position: relative;
 
     width: 100%;
 
-    aspect-ratio: 4 / 3;
+    aspect-ratio:
+        4 / 3;
 
     overflow: hidden;
 
     background:
-
-        var(--camera-bg);
+        var(--camera);
 
     border-radius: 13px;
-
 }
 
 .camera {
-
     display: block;
 
     width: 100%;
-
     height: 100%;
 
     object-fit: cover;
 
     background:
-
-        var(--camera-bg);
-
+        var(--camera);
 }
 
 .camera-state {
-
     position: absolute;
 
     left: 10px;
-
     bottom: 10px;
 
-    padding:
-
-        5px 8px;
+    padding: 5px 8px;
 
     color: white;
 
     background:
-
-        rgba(0, 0, 0, 0.5);
+        rgba(
+            0,
+            0,
+            0,
+            0.5
+        );
 
     border-radius: 8px;
 
     font-size: 11px;
-
 }
 
 .motion {
-
     min-height: 24px;
 
-    margin-bottom: 9px;
+    margin-bottom: 8px;
 
     text-align: center;
 
     color:
-
         var(--sub);
 
     font-weight: 700;
-
-}
-
-.pad {
-
-    display: grid;
-
-    grid-template-columns:
-
-        repeat(
-
-            3,
-
-            1fr
-
-        );
-
-    gap: 9px;
-
 }
 
 .row2 {
-
     display: grid;
 
     grid-template-columns:
-
         1fr 1fr;
 
     gap: 9px;
-
 }
 
 .btn {
-
     min-height: 68px;
 
     padding: 8px;
 
     border:
-
         1px solid
-
         var(--border);
 
     border-radius: 15px;
 
     background:
-
         var(--white);
 
     color:
-
         var(--text);
 
     font-size: 15px;
-
     font-weight: 800;
 
     touch-action: none;
 
     user-select: none;
-
     -webkit-user-select: none;
-
 }
 
 .btn.active {
-
     background:
-
         var(--blue);
 
-    color:
-
-        white;
+    color: white;
 
     border-color:
-
         var(--blue);
-
-}
-
-.stop {
-
-    background:
-
-        var(--red-light);
-
-    color:
-
-        var(--red);
-
-    border-color:
-
-        transparent;
-
 }
 
 .light-on {
-
     background:
-
         var(--green-light);
 
     color:
-
         var(--green);
-
 }
 
 .light-off {
-
     background:
-
         var(--blue-light);
 
     color:
-
         var(--blue);
-
 }
 
 .light-selected {
-
     background:
-
-        var(--green) !important;
+        var(--green)
+        !important;
 
     color:
-
-        white !important;
-
+        white
+        !important;
 }
 
 .grab {
-
     background:
-
         var(--green-light);
 
     color:
-
         var(--green);
-
 }
 
 .loose {
-
     background:
-
         var(--blue-light);
 
     color:
-
         var(--blue);
-
 }
 
 .info {
-
     margin-top: 9px;
 
     color:
-
         var(--sub);
 
     font-size: 11px;
-
     line-height: 1.5;
-
 }
 
 .footer {
-
     padding:
-
         2px 4px 10px;
 
     text-align: center;
 
     color:
-
         var(--sub);
 
     font-size: 10px;
-
-}
-
-/* ======================================================
-   카메라 전체화면
-   - 가로: 카메라 왼쪽 / 조작부 오른쪽
-   - 세로: 카메라 위 / 조작부 아래
-====================================================== */
-
-.card-title-row {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 10px;
-    margin-bottom: 10px;
-}
-
-.card-title-row .card-title {
-    margin-bottom: 0;
 }
 
 .fullscreen-button {
     width: 42px;
     height: 38px;
-    border: 1px solid var(--border);
+
+    border:
+        1px solid
+        var(--border);
+
     border-radius: 11px;
-    background: var(--white);
-    color: var(--text);
+
+    background:
+        var(--white);
+
+    color:
+        var(--text);
+
     font-size: 20px;
     font-weight: 800;
 }
 
+
+/* ======================================================
+   원형 조이스틱
+   화살표 없음
+====================================================== */
+
+.joystick-wrap {
+    display: flex;
+
+    justify-content:
+        center;
+
+    align-items:
+        center;
+
+    padding:
+        6px 0 2px;
+}
+
+.joystick {
+    position: relative;
+
+    width:
+        min(
+            68vw,
+            290px
+        );
+
+    height:
+        min(
+            68vw,
+            290px
+        );
+
+    border-radius: 50%;
+
+    background:
+        var(--joy-base);
+
+    border:
+        6px solid
+        var(--joy-line);
+
+    touch-action: none;
+
+    user-select: none;
+    -webkit-user-select: none;
+}
+
+.joystick::before,
+.joystick::after {
+    content: "";
+
+    position: absolute;
+
+    left: 50%;
+    top: 50%;
+
+    transform:
+        translate(
+            -50%,
+            -50%
+        );
+
+    background:
+        rgba(
+            235,
+            235,
+            235,
+            0.62
+        );
+
+    pointer-events: none;
+}
+
+.joystick::before {
+    width: 2px;
+    height: 100%;
+}
+
+.joystick::after {
+    width: 100%;
+    height: 2px;
+}
+
+.joystick-knob {
+    position: absolute;
+
+    left: 50%;
+    top: 50%;
+
+    width: 34%;
+    height: 34%;
+
+    transform:
+        translate(
+            -50%,
+            -50%
+        );
+
+    border-radius: 50%;
+
+    background:
+        var(--joy-knob);
+
+    box-shadow:
+        0 4px 14px
+        rgba(
+            0,
+            0,
+            0,
+            0.24
+        );
+
+    pointer-events: none;
+}
+
+.joystick-hint {
+    margin-top: 10px;
+
+    text-align: center;
+
+    color:
+        var(--sub);
+
+    font-size: 11px;
+}
+
+
+/* ======================================================
+   카메라 전체화면
+====================================================== */
+
 .app.camera-fullscreen {
     position: fixed;
+
     inset: 0;
+
     z-index: 9999;
+
     width: 100vw;
     max-width: none;
     height: 100vh;
+
     margin: 0;
     padding: 12px;
+
     overflow: hidden;
-    background: #0e1116;
+
+    background:
+        #0e1116;
+
     display: grid;
-    grid-template-columns: minmax(0, 1fr) 330px;
-    grid-template-rows: auto auto 1fr;
+
+    grid-template-columns:
+        minmax(0, 1fr)
+        330px;
+
+    grid-template-rows:
+        auto auto 1fr;
+
     gap: 12px;
 }
 
-.app.camera-fullscreen .header,
-.app.camera-fullscreen .footer {
+.app.camera-fullscreen
+.header,
+
+.app.camera-fullscreen
+.footer {
     display: none;
 }
 
-.app.camera-fullscreen .card {
+.app.camera-fullscreen
+.card {
     margin: 0;
 }
 
-.app.camera-fullscreen .camera-card {
+.app.camera-fullscreen
+.camera-card {
     grid-column: 1;
     grid-row: 1 / 4;
+
     min-width: 0;
     min-height: 0;
+
     display: flex;
-    flex-direction: column;
-    background: #0e1116;
-    border-color: #2b313a;
+
+    flex-direction:
+        column;
+
+    background:
+        #0e1116;
+
+    border-color:
+        #2b313a;
 }
 
-.app.camera-fullscreen .camera-card .card-title {
+.app.camera-fullscreen
+.camera-card
+.card-title {
     color: white;
 }
 
-.app.camera-fullscreen .camera-card .fullscreen-button {
-    background: #20252d;
-    color: white;
-    border-color: #353c47;
-}
-
-.app.camera-fullscreen .camera-box {
+.app.camera-fullscreen
+.camera-box {
     flex: 1;
+
     min-height: 0;
-    aspect-ratio: auto;
+
+    aspect-ratio:
+        auto;
 }
 
-.app.camera-fullscreen .camera {
-    object-fit: contain;
+.app.camera-fullscreen
+.camera {
+    object-fit:
+        contain;
 }
 
-.app.camera-fullscreen .move-card {
+.app.camera-fullscreen
+.move-card {
     grid-column: 2;
     grid-row: 1;
 }
 
-.app.camera-fullscreen .light-card {
+.app.camera-fullscreen
+.light-card {
     grid-column: 2;
     grid-row: 2;
 }
 
-.app.camera-fullscreen .gripper-card {
+.app.camera-fullscreen
+.gripper-card {
     grid-column: 2;
     grid-row: 3;
-    overflow-y: auto;
 }
 
-@media (orientation: portrait), (max-width: 700px) {
+.app.camera-fullscreen
+.joystick {
+    width:
+        min(
+            28vw,
+            250px
+        );
+
+    height:
+        min(
+            28vw,
+            250px
+        );
+}
+
+@media
+(orientation: portrait),
+(max-width: 700px) {
+
     .app.camera-fullscreen {
-        overflow-y: auto;
-        grid-template-columns: 1fr;
-        grid-template-rows: 55vh auto auto auto;
+        overflow-y:
+            auto;
+
+        grid-template-columns:
+            1fr;
+
+        grid-template-rows:
+            55vh
+            auto
+            auto
+            auto;
     }
 
-    .app.camera-fullscreen .camera-card {
+    .app.camera-fullscreen
+    .camera-card {
         grid-column: 1;
         grid-row: 1;
     }
 
-    .app.camera-fullscreen .move-card {
+    .app.camera-fullscreen
+    .move-card {
         grid-column: 1;
         grid-row: 2;
     }
 
-    .app.camera-fullscreen .light-card {
+    .app.camera-fullscreen
+    .light-card {
         grid-column: 1;
         grid-row: 3;
     }
 
-    .app.camera-fullscreen .gripper-card {
+    .app.camera-fullscreen
+    .gripper-card {
         grid-column: 1;
         grid-row: 4;
-        overflow: visible;
+    }
+
+    .app.camera-fullscreen
+    .joystick {
+        width:
+            min(
+                64vw,
+                260px
+            );
+
+        height:
+            min(
+                64vw,
+                260px
+            );
     }
 }
 
 </style>
-
 </head>
 
 <body>
 
 <div class="app">
 
-<!-- =====================================================
-
-     HEADER
-
-===================================================== -->
-
 <div class="header">
 
     <div>
 
         <div class="title">
-
             PiCar-Pro
-
         </div>
 
         <div class="subtitle">
-
             Mobile Control
-
         </div>
 
     </div>
@@ -1820,28 +1286,20 @@ body {
     <div class="server">
 
         <span
-
             id="serverDot"
-
             class="dot"
-
         ></span>
 
         <span id="serverText">
-
             연결됨
-
         </span>
 
     </div>
 
 </div>
 
-<!-- =====================================================
 
-     CAMERA
-
-===================================================== -->
+<!-- 카메라 -->
 
 <div class="card camera-card">
 
@@ -1855,7 +1313,6 @@ body {
             id="fullscreenButton"
             class="fullscreen-button"
             type="button"
-            aria-label="카메라 전체화면"
         >
             ⛶
         </button>
@@ -1865,357 +1322,195 @@ body {
     <div class="camera-box">
 
         <img
-
             id="robotCamera"
-
             class="camera"
-
             src="/video_feed"
-
             alt="Robot Camera"
-
         >
 
         <div
-
             id="cameraState"
-
             class="camera-state"
-
         >
-
             LIVE
-
         </div>
 
     </div>
 
 </div>
 
-<!-- =====================================================
 
-     MOVE
-
-===================================================== -->
+<!-- 원형 조이스틱 -->
 
 <div class="card move-card">
 
     <div class="card-title">
-
         이동 제어
-
     </div>
 
     <div
-
         id="motion"
-
         class="motion"
-
     >
-
         정지
+    </div>
+
+    <div class="joystick-wrap">
+
+        <div
+            id="joystick"
+            class="joystick"
+        >
+
+            <div
+                id="joystickKnob"
+                class="joystick-knob"
+            ></div>
+
+        </div>
 
     </div>
 
-    <div class="pad">
-
-        <div></div>
-
-        <button
-
-            class="btn move"
-
-            data-command="forward"
-
-            data-name="전진"
-
-        >
-
-            ▲
-
-            <br>
-
-            전진
-
-        </button>
-
-        <div></div>
-
-        <button
-
-            class="btn move"
-
-            data-command="left"
-
-            data-name="전진 좌회전"
-
-        >
-
-            ◀
-
-            <br>
-
-            좌회전
-
-        </button>
-
-        <button
-
-            id="stopButton"
-
-            class="btn stop"
-
-        >
-
-            ■
-
-            <br>
-
-            STOP
-
-        </button>
-
-        <button
-
-            class="btn move"
-
-            data-command="right"
-
-            data-name="전진 우회전"
-
-        >
-
-            ▶
-
-            <br>
-
-            우회전
-
-        </button>
-
-        <button
-
-            class="btn move"
-
-            data-command="backleft"
-
-            data-name="후진 좌회전"
-
-        >
-
-            ↙
-
-            <br>
-
-            후진 좌
-
-        </button>
-
-        <button
-
-            class="btn move"
-
-            data-command="backward"
-
-            data-name="후진"
-
-        >
-
-            ▼
-
-            <br>
-
-            후진
-
-        </button>
-
-        <button
-
-            class="btn move"
-
-            data-command="backright"
-
-            data-name="후진 우회전"
-
-        >
-
-            ↘
-
-            <br>
-
-            후진 우
-
-        </button>
-
+    <div class="joystick-hint">
+        작은 원을 원하는 방향으로 움직이세요.
+        손을 떼면 자동 정지합니다.
     </div>
 
 </div>
 
-<!-- =====================================================
 
-     LIGHT
-
-===================================================== -->
+<!-- 라이트 -->
 
 <div class="card light-card">
 
     <div class="card-title">
-
         라이트
-
     </div>
 
     <div class="row2">
 
         <button
-
             id="lightOn"
-
             class="btn light-on"
-
         >
-
             LIGHT ON
-
         </button>
 
         <button
-
             id="lightOff"
-
             class="btn light-off"
-
         >
-
             LIGHT OFF
-
             <br>
 
             <small>
-
                 자동 모드
-
             </small>
-
         </button>
 
     </div>
 
     <div
-
         id="lightText"
-
         class="info"
-
     >
-
         현재: 자동 모드
-
     </div>
 
 </div>
 
-<!-- =====================================================
 
-     GRIPPER
-
-===================================================== -->
+<!-- 집게 -->
 
 <div class="card gripper-card">
 
     <div class="card-title">
-
         집게
-
     </div>
 
     <div class="row2">
 
         <button
-
             class="btn grip grab"
-
             data-command="grab"
-
         >
-
             잡기
-
         </button>
 
         <button
-
             class="btn grip loose"
-
             data-command="loose"
-
         >
-
             놓기
-
         </button>
 
     </div>
 
     <div class="info">
-
         버튼을 누르고 있는 동안 움직이고
-
         손을 떼면 정지합니다.
-
     </div>
 
 </div>
 
 <div class="footer">
-
     PiCar-Pro Mobile GUI
-
 </div>
 
 </div>
+
 
 <script>
 
-let movingButton = null;
+let gripButton = null;
 
-// ========================================================
+let joystickActive = false;
+let joystickPointerId = null;
+let joystickCommand = "stop_move";
 
-// 서버 상태
+/* 새로고침 후에도 이전 seq보다 큰 값이 되도록 현재 시간을 사용 */
+let movementSequence = Date.now();
 
-// ========================================================
+let gripChain =
+    Promise.resolve();
+
+const joystick =
+    document.getElementById(
+        "joystick"
+    );
+
+const joystickKnob =
+    document.getElementById(
+        "joystickKnob"
+    );
+
+const DEAD_ZONE = 0.22;
+
+
+/* ========================================================
+   서버 상태
+======================================================== */
 
 function setConnected(
-
     connected
-
 ) {
 
     const text =
-
         document.getElementById(
-
             "serverText"
-
         );
 
     const dot =
-
         document.getElementById(
-
             "serverDot"
-
         );
 
     if (connected) {
 
         text.textContent =
-
             "연결됨";
 
         dot.style.background =
-
             "#20a06b";
 
     }
@@ -2223,35 +1518,28 @@ function setConnected(
     else {
 
         text.textContent =
-
             "연결 오류";
 
         dot.style.background =
-
             "#e34d59";
 
     }
 
 }
 
-// ========================================================
 
-// 서버 명령
-
-// ========================================================
+/* ========================================================
+   일반 명령
+======================================================== */
 
 async function sendCommand(
-
     command,
-
     keepalive=false
-
 ) {
 
     try {
 
         const response =
-
             await fetch(
 
                 "/api/command",
@@ -2259,33 +1547,27 @@ async function sendCommand(
                 {
 
                     method:
-
                         "POST",
 
                     headers: {
 
                         "Content-Type":
-
                             "application/json"
 
                     },
 
                     body:
-
                         JSON.stringify({
 
                             command:
-
                                 command
 
                         }),
 
                     cache:
-
                         "no-store",
 
                     keepalive:
-
                         keepalive
 
                 }
@@ -2293,31 +1575,21 @@ async function sendCommand(
             );
 
         if (!response.ok) {
-
-            throw new Error(
-
-                "HTTP ERROR"
-
-            );
-
+            throw new Error();
         }
 
         setConnected(
-
             true
-
         );
 
         return true;
 
     }
 
-    catch (error) {
+    catch (_) {
 
         setConnected(
-
             false
-
         );
 
         return false;
@@ -2326,86 +1598,683 @@ async function sendCommand(
 
 }
 
-// ========================================================
 
-// 이동 상태 표시
+/* ========================================================
+   조이스틱 이동 명령
+======================================================== */
 
-// ========================================================
+function sendMoveCommand(
+    command
+) {
+
+    movementSequence += 1;
+
+    const seq =
+        movementSequence;
+
+    fetch(
+
+        "/api/command",
+
+        {
+
+            method:
+                "POST",
+
+            headers: {
+
+                "Content-Type":
+                    "application/json"
+
+            },
+
+            body:
+                JSON.stringify({
+
+                    command:
+                        command,
+
+                    seq:
+                        seq
+
+                }),
+
+            cache:
+                "no-store",
+
+            keepalive:
+                true
+
+        }
+
+    )
+
+    .then(
+        response => {
+
+            if (!response.ok) {
+                throw new Error();
+            }
+
+            setConnected(
+                true
+            );
+
+        }
+    )
+
+    .catch(
+        () => {
+
+            setConnected(
+                false
+            );
+
+        }
+    );
+
+}
+
+
+/* ========================================================
+   집게 명령 순서 보장
+======================================================== */
+
+function queueGripCommand(
+    command
+) {
+
+    gripChain =
+        gripChain.then(
+
+            () =>
+                sendCommand(
+                    command,
+                    true
+                )
+
+        );
+
+    return gripChain;
+
+}
+
 
 function setMotion(
-
     text
-
 ) {
 
     document
-
         .getElementById(
-
             "motion"
-
         )
-
         .textContent =
-
             text;
 
 }
 
-// ========================================================
 
-// 안전 정지
+/* ========================================================
+   조이스틱 방향 판정
+======================================================== */
 
-// ========================================================
+function getJoystickCommand(
+    nx,
+    ny
+) {
 
-async function stopMovement() {
+    const distance =
+        Math.sqrt(
+            nx * nx
+            +
+            ny * ny
+        );
 
-    if (movingButton) {
+    if (distance < DEAD_ZONE) {
 
-        movingButton
+        return {
 
-            .classList
+            command:
+                "stop_move",
 
-            .remove(
+            label:
+                "정지"
 
-                "active"
-
-            );
-
-        movingButton = null;
+        };
 
     }
 
-    setMotion(
 
-        "정지"
+    const angle =
+        Math.atan2(
+            -ny,
+            nx
+        )
+        *
+        180
+        /
+        Math.PI;
 
-    );
 
-    await sendCommand(
+    if (
+        angle >= -22.5
+        &&
+        angle < 22.5
+    ) {
 
-        "stop_move",
+        return {
+            command:
+                "right",
 
-        true
+            label:
+                "우회전"
+        };
 
-    );
+    }
+
+
+    if (
+        angle >= 22.5
+        &&
+        angle < 67.5
+    ) {
+
+        return {
+            command:
+                "right",
+
+            label:
+                "전진 우회전"
+        };
+
+    }
+
+
+    if (
+        angle >= 67.5
+        &&
+        angle < 112.5
+    ) {
+
+        return {
+            command:
+                "forward",
+
+            label:
+                "전진"
+        };
+
+    }
+
+
+    if (
+        angle >= 112.5
+        &&
+        angle < 157.5
+    ) {
+
+        return {
+            command:
+                "left",
+
+            label:
+                "전진 좌회전"
+        };
+
+    }
+
+
+    if (
+        angle >= 157.5
+        ||
+        angle < -157.5
+    ) {
+
+        return {
+            command:
+                "left",
+
+            label:
+                "좌회전"
+        };
+
+    }
+
+
+    if (
+        angle >= -157.5
+        &&
+        angle < -112.5
+    ) {
+
+        return {
+            command:
+                "backleft",
+
+            label:
+                "후진 좌회전"
+        };
+
+    }
+
+
+    if (
+        angle >= -112.5
+        &&
+        angle < -67.5
+    ) {
+
+        return {
+            command:
+                "backward",
+
+            label:
+                "후진"
+        };
+
+    }
+
+
+    return {
+
+        command:
+            "backright",
+
+        label:
+            "후진 우회전"
+
+    };
 
 }
 
-// ========================================================
 
-// 이동 버튼
+/* ========================================================
+   조이스틱 위치 갱신
+======================================================== */
 
-// ========================================================
+function updateJoystick(
+    clientX,
+    clientY
+) {
+
+    const rect =
+        joystick.getBoundingClientRect();
+
+    const centerX =
+        rect.left
+        +
+        rect.width / 2;
+
+    const centerY =
+        rect.top
+        +
+        rect.height / 2;
+
+    const maxRadius =
+        rect.width
+        *
+        0.33;
+
+
+    let dx =
+        clientX
+        -
+        centerX;
+
+    let dy =
+        clientY
+        -
+        centerY;
+
+
+    const distance =
+        Math.sqrt(
+            dx * dx
+            +
+            dy * dy
+        );
+
+
+    if (
+        distance
+        >
+        maxRadius
+    ) {
+
+        const scale =
+            maxRadius
+            /
+            distance;
+
+        dx *= scale;
+        dy *= scale;
+
+    }
+
+
+    joystickKnob.style.transform =
+
+        "translate("
+        +
+        "calc(-50% + "
+        +
+        dx
+        +
+        "px), "
+        +
+        "calc(-50% + "
+        +
+        dy
+        +
+        "px)"
+        +
+        ")";
+
+
+    const nx =
+        dx
+        /
+        maxRadius;
+
+    const ny =
+        dy
+        /
+        maxRadius;
+
+
+    const result =
+        getJoystickCommand(
+            nx,
+            ny
+        );
+
+
+    setMotion(
+        result.label
+    );
+
+
+    if (
+        result.command
+        !==
+        joystickCommand
+    ) {
+
+        joystickCommand =
+            result.command;
+
+        sendMoveCommand(
+            result.command
+        );
+
+    }
+
+}
+
+
+/* ========================================================
+   조이스틱 중앙 복귀 + 정지
+======================================================== */
+
+function resetJoystick() {
+
+    joystickActive =
+        false;
+
+    joystickPointerId =
+        null;
+
+
+    joystickKnob.style.transform =
+        "translate(-50%, -50%)";
+
+
+    setMotion(
+        "정지"
+    );
+
+
+    if (
+        joystickCommand
+        !==
+        "stop_move"
+    ) {
+
+        joystickCommand =
+            "stop_move";
+
+        sendMoveCommand(
+            "stop_move"
+        );
+
+    }
+
+}
+
+
+/* ========================================================
+   조이스틱 터치/드래그
+======================================================== */
+
+joystick.addEventListener(
+
+    "pointerdown",
+
+    event => {
+
+        event.preventDefault();
+
+        joystickActive =
+            true;
+
+        joystickPointerId =
+            event.pointerId;
+
+        try {
+
+            joystick.setPointerCapture(
+                event.pointerId
+            );
+
+        }
+
+        catch (_) {
+        }
+
+        updateJoystick(
+            event.clientX,
+            event.clientY
+        );
+
+    }
+
+);
+
+
+joystick.addEventListener(
+
+    "pointermove",
+
+    event => {
+
+        if (
+            !joystickActive
+            ||
+            event.pointerId
+            !==
+            joystickPointerId
+        ) {
+
+            return;
+
+        }
+
+        event.preventDefault();
+
+        updateJoystick(
+            event.clientX,
+            event.clientY
+        );
+
+    }
+
+);
+
+
+joystick.addEventListener(
+
+    "pointerup",
+
+    event => {
+
+        if (
+            event.pointerId
+            ===
+            joystickPointerId
+        ) {
+
+            event.preventDefault();
+
+            resetJoystick();
+
+        }
+
+    }
+
+);
+
+
+joystick.addEventListener(
+
+    "pointercancel",
+
+    event => {
+
+        if (
+            event.pointerId
+            ===
+            joystickPointerId
+        ) {
+
+            resetJoystick();
+
+        }
+
+    }
+
+);
+
+
+/* ========================================================
+   라이트
+======================================================== */
 
 document
-
-    .querySelectorAll(
-
-        ".move"
-
+    .getElementById(
+        "lightOn"
     )
+    .addEventListener(
 
+        "click",
+
+        async () => {
+
+            const ok =
+                await sendCommand(
+                    "light_on"
+                );
+
+            if (!ok) {
+                return;
+            }
+
+            document
+                .getElementById(
+                    "lightText"
+                )
+                .textContent =
+                    "현재: 양쪽 라이트 계속 ON";
+
+            document
+                .getElementById(
+                    "lightOn"
+                )
+                .classList
+                .add(
+                    "light-selected"
+                );
+
+            document
+                .getElementById(
+                    "lightOff"
+                )
+                .classList
+                .remove(
+                    "light-selected"
+                );
+
+        }
+
+    );
+
+
+document
+    .getElementById(
+        "lightOff"
+    )
+    .addEventListener(
+
+        "click",
+
+        async () => {
+
+            const ok =
+                await sendCommand(
+                    "light_off"
+                );
+
+            if (!ok) {
+                return;
+            }
+
+            document
+                .getElementById(
+                    "lightText"
+                )
+                .textContent =
+                    "현재: 자동 모드";
+
+            document
+                .getElementById(
+                    "lightOn"
+                )
+                .classList
+                .remove(
+                    "light-selected"
+                );
+
+            document
+                .getElementById(
+                    "lightOff"
+                )
+                .classList
+                .add(
+                    "light-selected"
+                );
+
+        }
+
+    );
+
+
+/* ========================================================
+   집게
+======================================================== */
+
+document
+    .querySelectorAll(
+        ".grip"
+    )
     .forEach(
 
         button => {
@@ -2414,86 +2283,64 @@ document
 
                 "pointerdown",
 
-                async event => {
+                event => {
 
                     event.preventDefault();
 
                     if (
-
-                        movingButton
-
+                        gripButton
                         &&
-
-                        movingButton !== button
-
+                        gripButton
+                        !==
+                        button
                     ) {
 
-                        movingButton
-
+                        gripButton
                             .classList
-
                             .remove(
-
                                 "active"
-
                             );
 
                     }
 
-                    movingButton =
-
+                    gripButton =
                         button;
 
                     button
-
                         .classList
-
                         .add(
-
                             "active"
-
                         );
-
-                    setMotion(
-
-                        button.dataset.name
-
-                    );
 
                     try {
 
                         button.setPointerCapture(
-
                             event.pointerId
-
                         );
 
                     }
 
                     catch (_) {
-
                     }
 
-                    await sendCommand(
-
+                    queueGripCommand(
                         button.dataset.command
-
                     );
 
                 }
 
             );
 
-            const finishMove =
 
-                async event => {
+            const stopGrip =
+                event => {
 
                     event.preventDefault();
 
                     if (
-
-                        movingButton !== button
-
+                        gripButton
+                        !==
+                        button
                     ) {
 
                         return;
@@ -2501,346 +2348,39 @@ document
                     }
 
                     button
-
                         .classList
-
                         .remove(
-
                             "active"
-
                         );
 
-                    movingButton = null;
+                    gripButton =
+                        null;
 
-                    setMotion(
-
-                        "정지"
-
-                    );
-
-                    await sendCommand(
-
-                        "stop_move"
-
-                    );
-
-                };
-
-            button.addEventListener(
-
-                "pointerup",
-
-                finishMove
-
-            );
-
-            button.addEventListener(
-
-                "pointercancel",
-
-                finishMove
-
-            );
-
-        }
-
-    );
-
-// ========================================================
-
-// STOP
-
-// ========================================================
-
-document
-
-    .getElementById(
-
-        "stopButton"
-
-    )
-
-    .addEventListener(
-
-        "click",
-
-        stopMovement
-
-    );
-
-// ========================================================
-
-// LIGHT ON
-
-// ========================================================
-
-document
-
-    .getElementById(
-
-        "lightOn"
-
-    )
-
-    .addEventListener(
-
-        "click",
-
-        async () => {
-
-            const ok =
-
-                await sendCommand(
-
-                    "light_on"
-
-                );
-
-            if (!ok) {
-
-                return;
-
-            }
-
-            document
-
-                .getElementById(
-
-                    "lightText"
-
-                )
-
-                .textContent =
-
-                    "현재: 양쪽 라이트 계속 ON";
-
-            document
-
-                .getElementById(
-
-                    "lightOn"
-
-                )
-
-                .classList
-
-                .add(
-
-                    "light-selected"
-
-                );
-
-            document
-
-                .getElementById(
-
-                    "lightOff"
-
-                )
-
-                .classList
-
-                .remove(
-
-                    "light-selected"
-
-                );
-
-        }
-
-    );
-
-// ========================================================
-
-// LIGHT OFF
-
-// ========================================================
-
-document
-
-    .getElementById(
-
-        "lightOff"
-
-    )
-
-    .addEventListener(
-
-        "click",
-
-        async () => {
-
-            const ok =
-
-                await sendCommand(
-
-                    "light_off"
-
-                );
-
-            if (!ok) {
-
-                return;
-
-            }
-
-            document
-
-                .getElementById(
-
-                    "lightText"
-
-                )
-
-                .textContent =
-
-                    "현재: 자동 모드";
-
-            document
-
-                .getElementById(
-
-                    "lightOn"
-
-                )
-
-                .classList
-
-                .remove(
-
-                    "light-selected"
-
-                );
-
-            document
-
-                .getElementById(
-
-                    "lightOff"
-
-                )
-
-                .classList
-
-                .add(
-
-                    "light-selected"
-
-                );
-
-        }
-
-    );
-
-// ========================================================
-
-// 집게
-
-// ========================================================
-
-document
-
-    .querySelectorAll(
-
-        ".grip"
-
-    )
-
-    .forEach(
-
-        button => {
-
-            button.addEventListener(
-
-                "pointerdown",
-
-                async event => {
-
-                    event.preventDefault();
-
-                    button
-
-                        .classList
-
-                        .add(
-
-                            "active"
-
-                        );
-
-                    try {
-
-                        button.setPointerCapture(
-
-                            event.pointerId
-
-                        );
-
-                    }
-
-                    catch (_) {
-
-                    }
-
-                    await sendCommand(
-
-                        button.dataset.command
-
-                    );
-
-                }
-
-            );
-
-            const stopGrip =
-
-                async event => {
-
-                    event.preventDefault();
-
-                    button
-
-                        .classList
-
-                        .remove(
-
-                            "active"
-
-                        );
-
-                    await sendCommand(
-
+                    queueGripCommand(
                         "grip_stop"
-
                     );
 
                 };
 
+
             button.addEventListener(
-
                 "pointerup",
-
                 stopGrip
-
             );
 
             button.addEventListener(
-
                 "pointercancel",
-
                 stopGrip
-
             );
 
         }
 
     );
 
-// ========================================================
 
-// 화면에서 벗어나면 안전 정지
-
-// ========================================================
+/* ========================================================
+   화면 이탈 시 안전 정지
+======================================================== */
 
 window.addEventListener(
 
@@ -2848,15 +2388,33 @@ window.addEventListener(
 
     () => {
 
-        if (movingButton) {
+        if (joystickActive) {
 
-            stopMovement();
+            resetJoystick();
+
+        }
+
+        if (gripButton) {
+
+            gripButton
+                .classList
+                .remove(
+                    "active"
+                );
+
+            gripButton =
+                null;
+
+            queueGripCommand(
+                "grip_stop"
+            );
 
         }
 
     }
 
 );
+
 
 document.addEventListener(
 
@@ -2864,17 +2422,30 @@ document.addEventListener(
 
     () => {
 
-        if (
+        if (!document.hidden) {
+            return;
+        }
 
-            document.hidden
+        if (joystickActive) {
 
-            &&
+            resetJoystick();
 
-            movingButton
+        }
 
-        ) {
+        if (gripButton) {
 
-            stopMovement();
+            gripButton
+                .classList
+                .remove(
+                    "active"
+                );
+
+            gripButton =
+                null;
+
+            queueGripCommand(
+                "grip_stop"
+            );
 
         }
 
@@ -2882,11 +2453,10 @@ document.addEventListener(
 
 );
 
-// ========================================================
 
-// 페이지가 닫힐 때
-
-// ========================================================
+/* ========================================================
+   페이지 종료 시 안전 정지
+======================================================== */
 
 window.addEventListener(
 
@@ -2894,60 +2464,88 @@ window.addEventListener(
 
     () => {
 
-        if (movingButton) {
+        const moveData =
+            new Blob(
 
-            const data =
+                [
 
-                JSON.stringify({
+                    JSON.stringify({
 
-                    command:
+                        command:
+                            "stop_move",
 
-                        "stop_move"
+                        seq:
+                            movementSequence
+                            +
+                            1
 
-                });
+                    })
 
-            const blob =
+                ],
 
-                new Blob(
+                {
 
-                    [data],
+                    type:
+                        "application/json"
 
-                    {
-
-                        type:
-
-                            "application/json"
-
-                    }
-
-                );
-
-            navigator.sendBeacon(
-
-                "/api/command",
-
-                blob
+                }
 
             );
 
-        }
+        navigator.sendBeacon(
+
+            "/api/command",
+
+            moveData
+
+        );
+
+
+        const gripData =
+            new Blob(
+
+                [
+
+                    JSON.stringify({
+
+                        command:
+                            "grip_stop"
+
+                    })
+
+                ],
+
+                {
+
+                    type:
+                        "application/json"
+
+                }
+
+            );
+
+        navigator.sendBeacon(
+
+            "/api/command",
+
+            gripData
+
+        );
 
     }
 
 );
 
-// ========================================================
 
-// 현재 상태 불러오기
-
-// ========================================================
+/* ========================================================
+   현재 상태
+======================================================== */
 
 async function loadStatus() {
 
     try {
 
         const response =
-
             await fetch(
 
                 "/api/status",
@@ -2955,7 +2553,6 @@ async function loadStatus() {
                 {
 
                     cache:
-
                         "no-store"
 
                 }
@@ -2963,53 +2560,43 @@ async function loadStatus() {
             );
 
         if (!response.ok) {
-
             throw new Error();
-
         }
 
         const data =
-
             await response.json();
 
         setConnected(
-
             true
-
         );
 
         if (
-
             data.light_always_on
-
         ) {
 
             document
-
                 .getElementById(
-
                     "lightText"
-
                 )
-
                 .textContent =
-
                     "현재: 양쪽 라이트 계속 ON";
 
             document
-
                 .getElementById(
-
                     "lightOn"
-
                 )
-
                 .classList
-
                 .add(
-
                     "light-selected"
+                );
 
+            document
+                .getElementById(
+                    "lightOff"
+                )
+                .classList
+                .remove(
+                    "light-selected"
                 );
 
         }
@@ -3017,77 +2604,64 @@ async function loadStatus() {
         else {
 
             document
-
                 .getElementById(
-
                     "lightText"
-
                 )
-
                 .textContent =
-
                     "현재: 자동 모드";
 
             document
-
                 .getElementById(
-
-                    "lightOff"
-
+                    "lightOn"
                 )
-
                 .classList
-
-                .add(
-
+                .remove(
                     "light-selected"
+                );
 
+            document
+                .getElementById(
+                    "lightOff"
+                )
+                .classList
+                .add(
+                    "light-selected"
                 );
 
         }
 
     }
 
-    catch (error) {
+    catch (_) {
 
         setConnected(
-
             false
-
         );
 
     }
 
 }
 
-// ========================================================
 
-// 카메라 연결이 끊어지면 자동 재접속
-
-// ========================================================
+/* ========================================================
+   카메라 자동 재연결
+======================================================== */
 
 const cameraImage =
-
     document.getElementById(
-
         "robotCamera"
-
     );
+
 
 cameraImage.onerror =
 
     function () {
 
         document
-
             .getElementById(
-
                 "cameraState"
-
             )
-
             .textContent =
-
                 "재연결 중";
 
         setTimeout(
@@ -3098,7 +2672,8 @@ cameraImage.onerror =
 
                     "/video_feed?t="
 
-                    + Date.now();
+                    +
+                    Date.now();
 
             },
 
@@ -3108,27 +2683,24 @@ cameraImage.onerror =
 
     };
 
+
 cameraImage.onload =
 
     function () {
 
         document
-
             .getElementById(
-
                 "cameraState"
-
             )
-
             .textContent =
-
                 "LIVE";
 
     };
 
-// ========================================================
-// 카메라 전체화면
-// ========================================================
+
+/* ========================================================
+   카메라 전체화면
+======================================================== */
 
 const appRoot =
     document.querySelector(
@@ -3140,11 +2712,14 @@ const fullscreenButton =
         "fullscreenButton"
     );
 
+
 async function enterCameraFullscreen() {
 
-    appRoot.classList.add(
-        "camera-fullscreen"
-    );
+    appRoot
+        .classList
+        .add(
+            "camera-fullscreen"
+        );
 
     document.body.style.overflow =
         "hidden";
@@ -3167,17 +2742,18 @@ async function enterCameraFullscreen() {
     }
 
     catch (_) {
-        // iPhone Safari 등에서 Fullscreen API가 제한되어도
-        // CSS 전체화면은 그대로 유지한다.
     }
 
 }
 
+
 async function exitCameraFullscreen() {
 
-    appRoot.classList.remove(
-        "camera-fullscreen"
-    );
+    appRoot
+        .classList
+        .remove(
+            "camera-fullscreen"
+        );
 
     document.body.style.overflow =
         "";
@@ -3187,7 +2763,9 @@ async function exitCameraFullscreen() {
 
     try {
 
-        if (document.fullscreenElement) {
+        if (
+            document.fullscreenElement
+        ) {
 
             await document.exitFullscreen();
 
@@ -3200,14 +2778,19 @@ async function exitCameraFullscreen() {
 
 }
 
+
 fullscreenButton.addEventListener(
+
     "click",
+
     () => {
 
         if (
-            appRoot.classList.contains(
-                "camera-fullscreen"
-            )
+            appRoot
+                .classList
+                .contains(
+                    "camera-fullscreen"
+                )
         ) {
 
             exitCameraFullscreen();
@@ -3221,23 +2804,31 @@ fullscreenButton.addEventListener(
         }
 
     }
+
 );
 
+
 document.addEventListener(
+
     "fullscreenchange",
+
     () => {
 
         if (
             !document.fullscreenElement
             &&
-            appRoot.classList.contains(
-                "camera-fullscreen"
-            )
+            appRoot
+                .classList
+                .contains(
+                    "camera-fullscreen"
+                )
         ) {
 
-            appRoot.classList.remove(
-                "camera-fullscreen"
-            );
+            appRoot
+                .classList
+                .remove(
+                    "camera-fullscreen"
+                );
 
             document.body.style.overflow =
                 "";
@@ -3248,290 +2839,167 @@ document.addEventListener(
         }
 
     }
+
 );
+
 
 loadStatus();
 
 </script>
 
 </body>
-
 </html>
-
 """
 
+
 # =========================================================
-
 # HTTP Handler
-
 # =========================================================
 
 class MobileHandler(
-
     BaseHTTPRequestHandler
-
 ):
-
-    # HTTP/1.1 사용
 
     protocol_version = "HTTP/1.1"
 
-    # 브라우저 요청 로그가 계속 출력되는 것 방지
-
     def log_message(
-
         self,
-
         format,
-
         *args
-
     ):
-
         return
 
-    # =====================================================
-
-    # JSON 응답
-
-    # =====================================================
-
     def send_json(
-
         self,
-
         data,
-
         status=200
-
     ):
-
         body = json.dumps(
-
             data,
-
             ensure_ascii=False
-
         ).encode(
-
             "utf-8"
-
         )
 
         self.send_response(
-
             status
-
         )
 
         self.send_header(
-
             "Content-Type",
-
             "application/json; charset=utf-8"
-
         )
 
         self.send_header(
-
             "Content-Length",
-
             str(
-
                 len(body)
-
             )
-
         )
 
         self.send_header(
-
             "Cache-Control",
-
             "no-store"
-
         )
 
         self.end_headers()
 
         self.wfile.write(
-
             body
-
         )
 
-    # =====================================================
-
-    # GET
-
-    # =====================================================
-
     def do_GET(
-
         self
-
     ):
-
-        # =================================================
-
-        # 모바일 GUI
-
-        # =================================================
-
         if (
-
             self.path == "/"
-
             or
-
             self.path.startswith(
-
                 "/?"
-
             )
-
         ):
-
             body = (
-
-                MOBILE_HTML.encode(
-
+                MOBILE_HTML
+                .encode(
                     "utf-8"
-
                 )
-
             )
 
             self.send_response(
-
                 200
-
             )
 
             self.send_header(
-
                 "Content-Type",
-
                 "text/html; charset=utf-8"
-
             )
 
             self.send_header(
-
                 "Content-Length",
-
                 str(
-
                     len(body)
-
                 )
-
             )
 
             self.send_header(
-
                 "Cache-Control",
-
                 "no-store, no-cache, must-revalidate"
-
             )
 
             self.end_headers()
 
             self.wfile.write(
-
                 body
-
             )
 
             return
 
-        # =================================================
-
-        # 현재 상태
-
-        # =================================================
-
         if self.path.startswith(
-
             "/api/status"
-
         ):
-
             with control_lock:
-
                 data = {
-
                     "status":
-
                         "ok",
 
                     "motion":
-
                         current_motion,
 
                     "light_always_on":
-
                         light_always_on
-
                 }
 
             self.send_json(
-
                 data
-
             )
 
             return
 
-        # =================================================
-
-        # 카메라 실시간 영상
-
-        # =================================================
-
         if self.path.startswith(
-
             "/video_feed"
-
         ):
-
             self.send_response(
-
                 200
-
             )
 
             self.send_header(
-
                 "Content-Type",
-
                 "multipart/x-mixed-replace; boundary=frame"
-
             )
 
             self.send_header(
-
                 "Cache-Control",
-
                 "no-cache, no-store, must-revalidate"
-
             )
 
             self.send_header(
-
                 "Pragma",
-
                 "no-cache"
-
             )
 
             self.send_header(
-
                 "Expires",
-
                 "0"
-
             )
 
             self.end_headers()
@@ -3539,429 +3007,316 @@ class MobileHandler(
             last_id = -1
 
             try:
-
                 while server_running:
-
-                    # -------------------------------------
-
-                    # 새 프레임이 들어올 때까지 대기
-
-                    # -------------------------------------
 
                     with camera_condition:
 
                         camera_condition.wait_for(
-
                             lambda:
-
                                 (
-
                                     latest_frame_id
-
-                                    != last_id
-
+                                    !=
+                                    last_id
                                 )
-
                                 or
-
                                 (
-
-                                    not server_running
-
+                                    not
+                                    server_running
                                 ),
-
                             timeout=2.0
-
                         )
 
                         if not server_running:
-
                             break
 
                         jpeg = (
-
                             latest_jpeg
-
                         )
 
                         frame_id = (
-
                             latest_frame_id
-
                         )
 
-                    # -------------------------------------
-
-                    # 아직 카메라 데이터가 없으면
-
-                    # 다시 기다림
-
-                    # -------------------------------------
-
-                    if jpeg is None:
-
+                    if (
+                        jpeg is None
+                        or
+                        frame_id == last_id
+                    ):
                         continue
 
-                    # 같은 프레임이면 보내지 않음
-
-                    if frame_id == last_id:
-
-                        continue
-
-                    last_id = frame_id
-
-                    # -------------------------------------
-
-                    # MJPEG 프레임 전송
-
-                    # -------------------------------------
+                    last_id = (
+                        frame_id
+                    )
 
                     header = (
-
                         b"--frame\r\n"
-
                         b"Content-Type: image/jpeg\r\n"
-
                         +
-
                         (
-
                             f"Content-Length: "
-
-                            f"{len(jpeg)}\r\n\r\n"
-
+                            f"{len(jpeg)}"
+                            f"\r\n\r\n"
                         ).encode()
-
                     )
 
                     self.wfile.write(
-
                         header
-
                     )
 
                     self.wfile.write(
-
                         jpeg
-
                     )
 
                     self.wfile.write(
-
                         b"\r\n"
-
                     )
 
                     self.wfile.flush()
 
             except (
-
                 BrokenPipeError,
-
                 ConnectionResetError,
-
                 ConnectionAbortedError
-
             ):
-
                 print(
-
                     "[카메라] 브라우저 영상 연결 종료"
-
                 )
 
             except Exception as e:
-
                 print(
-
                     "[영상 스트림 오류]",
-
                     repr(e)
-
                 )
 
             return
 
-        # =================================================
-
-        # 존재하지 않는 주소
-
-        # =================================================
-
         self.send_error(
-
             404
-
         )
 
-    # =====================================================
-
-    # POST
-
-    # =====================================================
-
     def do_POST(
-
         self
-
     ):
+        global last_move_seq
 
         if not self.path.startswith(
-
             "/api/command"
-
         ):
-
             self.send_error(
-
                 404
-
             )
 
             return
 
         try:
-
             length = int(
-
                 self.headers.get(
-
                     "Content-Length",
-
                     "0"
-
                 )
-
             )
 
             raw = self.rfile.read(
-
                 length
-
             )
 
             data = json.loads(
-
                 raw.decode(
-
                     "utf-8"
-
                 )
-
             )
 
             command = str(
-
                 data.get(
-
                     "command",
-
                     ""
-
                 )
-
             ).strip()
 
             if not command:
-
                 self.send_json(
-
                     {
-
                         "status":
-
                             "error",
 
                         "message":
-
                             "명령 없음"
-
                     },
-
                     status=400
-
                 )
 
                 return
 
+            movement_commands = {
+                "forward",
+                "backward",
+                "left",
+                "right",
+                "backleft",
+                "backright",
+                "stop_move"
+            }
+
+            if command in movement_commands:
+
+                seq_value = (
+                    data.get(
+                        "seq"
+                    )
+                )
+
+                if seq_value is not None:
+
+                    seq_value = int(
+                        seq_value
+                    )
+
+                    with move_seq_lock:
+
+                        if (
+                            seq_value
+                            <=
+                            last_move_seq
+                        ):
+                            self.send_json(
+                                {
+                                    "status":
+                                        "ignored",
+
+                                    "command":
+                                        command,
+
+                                    "seq":
+                                        seq_value
+                                }
+                            )
+
+                            return
+
+                        last_move_seq = (
+                            seq_value
+                        )
+
             print(
-
                 "[모바일 명령]",
-
                 command
-
             )
 
             robot_ctrl(
-
                 command
-
             )
 
             self.send_json(
-
                 {
-
                     "status":
-
                         "ok",
 
                     "command":
-
                         command,
 
                     "motion":
-
                         current_motion,
 
                     "light_always_on":
-
                         light_always_on
-
                 }
-
             )
 
         except Exception as e:
-
             print(
-
                 "[모바일 명령 오류]",
-
                 repr(e)
-
             )
 
             self.send_json(
-
                 {
-
                     "status":
-
                         "error",
 
                     "message":
-
                         str(e)
-
                 },
-
                 status=500
-
             )
 
+
 # =========================================================
-
 # HTTP Server
-
 # =========================================================
 
 class MobileHTTPServer(
-
     ThreadingHTTPServer
-
 ):
 
     allow_reuse_address = True
-
     daemon_threads = True
 
+
 # =========================================================
-
 # MAIN
-
 # =========================================================
 
 def main():
-
     global server_running
-
     global yolo_detector
-
-    print(
-
-        "=========================================="
-
-    )
-
-    print(
-
-        " PiCar-Pro Mobile Web Server"
-
-    )
-
-    print(
-
-        "=========================================="
-
-    )
-
-    print(
-
-        "파일 : GUIServer_mobile.py"
-
-    )
-
-    print(
-
-        f"WEB PORT     : {WEB_PORT}"
-
-    )
-
-    print(
-
-        f"DRIVE SPEED  : {DRIVE_SPEED}"
-
-    )
-
-    print(
-
-        f"TURN SPEED   : {TURN_SPEED}"
-
-    )
-
-    print(
-
-        f"CAMERA       : "
-
-        f"{CAMERA_WIDTH}x{CAMERA_HEIGHT} "
-
-        f"{CAMERA_FPS}FPS"
-
-    )
-
-    print(
-
-        f"CAMERA SERVO : "
-
-        f"{CAMERA_FIXED_ANGLE}도 고정"
-
-    )
-
-    print(
-
-        "LIGHT MODE   : 자동"
-
-    )
-
-    print(
-        f"YOLO MODEL   : {YOLO_MODEL_PATH}"
-    )
-
-    print(
-
-        "=========================================="
-
-    )
-
-    # =====================================================
-
-    # OLED 눈동자 시작
-
-    # =====================================================
-
+    global async_yolo
     global oled_eyes
 
+    print(
+        "=========================================="
+    )
+
+    print(
+        " PiCar-Pro Mobile Web Server"
+    )
+
+    print(
+        "=========================================="
+    )
+
+    print(
+        f"WEB PORT     : "
+        f"{WEB_PORT}"
+    )
+
+    print(
+        f"DRIVE SPEED  : "
+        f"{DRIVE_SPEED}"
+    )
+
+    print(
+        f"TURN SPEED   : "
+        f"{TURN_SPEED}"
+    )
+
+    print(
+        f"CAMERA       : "
+        f"{CAMERA_WIDTH}x"
+        f"{CAMERA_HEIGHT} "
+        f"{CAMERA_FPS}FPS"
+    )
+
+    print(
+        f"CAMERA SERVO : "
+        f"{CAMERA_FIXED_ANGLE}도 고정"
+    )
+
+    print(
+        f"YOLO         : "
+        f"{YOLO_MODEL_PATH}, "
+        f"imgsz={YOLO_IMAGE_SIZE}, "
+        f"every={YOLO_DETECT_EVERY_N_FRAMES}"
+    )
+
+    print(
+        "MOVE GUI     : 원형 조이스틱"
+    )
+
+    print(
+        "=========================================="
+    )
+
+    # OLED
     oled_eyes = OLEDEyes(
         port=1,
         address=0x3C
@@ -3969,235 +3324,165 @@ def main():
 
     if oled_eyes.connected:
         oled_eyes.start()
-        oled_set_direction("stop")
 
-    # =====================================================
-    # YOLO 객체 탐지 시작
-    # =====================================================
+        oled_set_direction(
+            "stop"
+        )
 
+    # YOLO
     try:
         yolo_detector = YOLODetector(
-            model_path=YOLO_MODEL_PATH,
-            confidence=YOLO_CONFIDENCE,
-            imgsz=YOLO_IMAGE_SIZE,
-            detect_every_n_frames=YOLO_DETECT_EVERY_N_FRAMES,
+            model_path=
+                YOLO_MODEL_PATH,
+
+            confidence=
+                YOLO_CONFIDENCE,
+
+            imgsz=
+                YOLO_IMAGE_SIZE,
+
+            detect_every_n_frames=
+                1
         )
+
+        async_yolo = AsyncYOLO(
+            yolo_detector
+        )
+
+        async_yolo.start()
+
     except Exception as e:
         yolo_detector = None
-        print("[YOLO] 초기화 실패:", repr(e))
-        print("[YOLO] 객체 탐지 없이 카메라만 실행합니다.")
+        async_yolo = None
 
-    # =====================================================
+        print(
+            "[YOLO] 초기화 실패:",
+            repr(e)
+        )
 
-    # 모터 초기화
+        print(
+            "[YOLO] 객체 탐지 없이 "
+            "카메라만 실행합니다."
+        )
 
-    # =====================================================
-
+    # 모터
     move.setup()
 
-    # =====================================================
-
-    # 라이트 초기화
-
-    # =====================================================
-
+    # 라이트
     try:
-
         switch.switchSetup()
-
         switch.set_all_switch_off()
 
     except Exception as e:
-
         print(
-
             "[라이트 초기화 경고]",
-
             e
-
         )
 
-    # =====================================================
-
-    # Servo 초기화
-
-    # =====================================================
-
+    # Servo
     initialize_servos()
 
-    # =====================================================
-
-    # 시작할 때 안전 정지
-
-    # =====================================================
-
+    # 시작 시 안전 정지
     safe_stop(
-
         force_lights_off=True
-
     )
 
-    # =====================================================
-
-    # 카메라 Thread 시작
-
-    # =====================================================
-
+    # 카메라 Thread
     threading.Thread(
-
         target=camera_worker,
-
         daemon=True,
-
         name="CameraThread"
-
     ).start()
 
-    # =====================================================
-
-    # HTTP Server
-
-    # =====================================================
-
+    # HTTP 서버
     server = MobileHTTPServer(
-
         (
-
             HOST,
-
             WEB_PORT
-
         ),
-
         MobileHandler
-
     )
 
     print()
 
     print(
-
         f"[모바일 주소] "
-
-        f"http://<라즈베리파이-IP>:{WEB_PORT}"
-
+        f"http://<라즈베리파이-IP>:"
+        f"{WEB_PORT}"
     )
 
     print(
-
         "[서버 종료] Ctrl + C"
-
     )
 
     print()
 
     try:
-
         server.serve_forever(
-
             poll_interval=0.5
-
         )
 
     except KeyboardInterrupt:
-
         print(
-
             "\n[서버] 종료 요청"
-
         )
 
     finally:
-
         server_running = False
 
-        # 기다리고 있는 카메라 스트림 Thread 깨우기
-
         with camera_condition:
-
             camera_condition.notify_all()
 
-        # 로봇 정지
+        gripper_stop()
 
         safe_stop(
-
             force_lights_off=True
-
         )
 
-        # 집게 정지
+        if async_yolo is not None:
+            async_yolo.stop()
 
         try:
-
-            gripper_servo.stopWiggle()
-
-        except Exception:
-            pass
-
-        # 웹 서버 종료
-
-        try:
-
             server.server_close()
-
         except Exception:
-
             pass
 
-        # 모터 종료
-
         try:
-
             move.destroy()
-
         except Exception:
-
             pass
 
-        # 라이트 종료
-
         try:
-
             switch.set_all_switch_off()
-
             switch.switchClose()
-
         except Exception:
-
             pass
 
-        # OLED 눈동자 종료
-
         try:
-
             if oled_eyes is not None:
 
-                oled_eyes.set_direction("stop")
+                oled_eyes.set_direction(
+                    "stop"
+                )
 
-                time.sleep(0.1)
+                time.sleep(
+                    0.1
+                )
 
                 oled_eyes.stop()
 
                 if oled_eyes.is_alive():
-
-                    oled_eyes.join(timeout=1.0)
+                    oled_eyes.join(
+                        timeout=1.0
+                    )
 
         except Exception:
-
             pass
 
         print(
-
             "[서버] 종료 완료"
-
         )
 
-# =========================================================
-
-# 실행
-
-# =========================================================
 
 if __name__ == "__main__":
-
     main()
