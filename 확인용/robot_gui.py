@@ -32,6 +32,7 @@ import zmq
 
 from PIL import Image, ImageTk
 from fullscreen_gui import FullscreenGUI
+from VoicePCGUI import attach_voice_panel
 
 # =========================================================
 # 서버 설정
@@ -778,6 +779,8 @@ server_dot.pack(side="left", padx= (0, 8))
 server_status = tk.Label(server_box, text="서버 연결 중", bg=WHITE, fg=SUBTEXT, font=small_font,)
 
 server_status.pack(side="left")
+
+attach_voice_panel(window, header, header_left)  # ReSpeaker Lite → Sherpa
 
 # =========================================================
 # 카메라 영역

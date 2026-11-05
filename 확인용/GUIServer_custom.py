@@ -56,6 +56,7 @@ import Switch as switch
 
 from OLED_eyes import OLEDEyes
 from YOLO_detector import YOLODetector
+from PiVoiceLauncher import start_voice
 
 
 
@@ -885,4 +886,5 @@ def main():
 
 if __name__ == "__main__":
 
+    start_voice()
     main()
