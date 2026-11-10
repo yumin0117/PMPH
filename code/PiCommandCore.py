@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """GUI 공통 처리: 공식 Sherpa → Claude API → 검증된 단일 동작.
 직접 실행하지 않습니다. PiCommandService.py가 import합니다.
-API 키/마이크 설정은 PiCommandConfig.py에서 서비스가 적용합니다.
+API 키/마이크 설정은 이 파일 상단에서 설정합니다. 별도 Config 파일은 사용하지 않습니다.
 마이크 증폭, 거리 제한, 추가 음량 필터는 없습니다.
 """
 import json
@@ -23,10 +23,11 @@ from urllib.request import Request, urlopen
 # ==================== 설정 ====================
 # 아래 따옴표 안에 본인의 Claude API 키를 넣으세요.
 # 예: CLAUDE_API_KEY = "sk-ant-..."
-CLAUDE_API_KEY = ""  # 실제 키는 PiCommandConfig.py 또는 환경변수에서 서비스가 읽음
+CLAUDE_API_KEY = ""  # 로봇에서 여기에 실제 키 입력. Git 업로드본은 빈칸 유지
+COMMAND_PORT = 5057
 
 BASE_DIR = Path(__file__).resolve().parent
-MODEL_DIR = BASE_DIR / "models/sherpa-onnx-streaming-zipformer-korean-2024-06-16"
+MODEL_DIR = Path("/home/pi/Adeept_PiCar-Pro/Server/models/sherpa-onnx-streaming-zipformer-korean-2024-06-16")
 SHERPA_APP = Path("/home/pi/sherpa-stt/sherpa-onnx-v1.12.1-linux-aarch64-shared-cpu")
 MIC_DEVICE = "plughw:CARD=Lite,DEV=0"  # 이전 확인된 ReSpeaker 식별자. 숫자 카드 번호를 고정하지 않음
 COMMAND_WINDOW_SECONDS = 6.0  # Enter 후 명령을 수집할 시간. 오디오 처리 설정이 아님

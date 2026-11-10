@@ -100,7 +100,7 @@ def attach_command_panel(window, parent, server_ip, port=5057, on_focus=None):
             elif data.get('error'):
                 label = data['error']
             if data.get('api_key_configured') is False:
-                label = '로봇의 PiCommandConfig.py에 Claude API 키를 입력하세요.'
+                label = '로봇의 PiCommandCore.py 상단 CLAUDE_API_KEY에 키를 입력하세요.'
             status.set(label)
             if data.get('text'):
                 detail = data['text']

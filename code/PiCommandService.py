@@ -2,33 +2,20 @@
 # -*- coding: utf-8 -*-
 """GUI 요청 처리. 터미널 input() 없이 로그만 출력한다."""
 import atexit
-import importlib
 import json
-import os
 import threading
 import time
 import uuid
-from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
 import PiCommandCore as core
 
 
-def load_config():
-    try:
-        config = importlib.import_module('PiCommandConfig')
-    except ModuleNotFoundError as exc:
-        if exc.name != 'PiCommandConfig':
-            raise
-        config = None
-    core.CLAUDE_MODEL = getattr(config, 'CLAUDE_MODEL', core.CLAUDE_MODEL)
-    core.MIC_DEVICE = getattr(config, 'MIC_DEVICE', core.MIC_DEVICE)
-    core.MODEL_DIR = Path(getattr(config, 'MODEL_DIR',
-        '/home/pi/Adeept_PiCar-Pro/Server/models/sherpa-onnx-streaming-zipformer-korean-2024-06-16'))
-    core.SHERPA_APP = Path(getattr(config, 'SHERPA_APP', core.SHERPA_APP))
-    key = getattr(config, 'CLAUDE_API_KEY', '').strip() or os.environ.get('ANTHROPIC_API_KEY', '').strip()
-    port = int(getattr(config, 'COMMAND_PORT', 5057))
+def load_settings():
+    """API에 전달할 키는 PiCommandCore.py의 값만 읽는다."""
+    key = core.CLAUDE_API_KEY.strip()
+    port = int(core.COMMAND_PORT)
     if not 1 <= port <= 65535:
         raise ValueError('COMMAND_PORT 설정 확인')
     return key, port
@@ -133,7 +120,7 @@ class CommandService:
             if self.data['busy']:
                 raise RuntimeError('명령 처리 중입니다. 완료 후 다시 입력하세요')
             if not self.key:
-                raise RuntimeError('로봇의 PiCommandConfig.py에 Claude API 키를 입력하세요')
+                raise RuntimeError('로봇의 PiCommandCore.py 상단 CLAUDE_API_KEY에 키를 입력하세요')
             cancel = threading.Event()
             self.cancel_event = cancel
             self.data = {'state': 'loading' if mode == 'voice' else 'analyzing', 'busy': True,
@@ -265,7 +252,7 @@ def handle_command_http(handler, service):
 
 
 def start_command_service(namespace):
-    key, port = load_config()
+    key, port = load_settings()
     service = CommandService(GuiRobot(namespace), key=key)
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -284,5 +271,5 @@ def start_command_service(namespace):
     atexit.register(service.close)
     print(f'[GUI 명령 서비스] 포트 {port} · 텍스트/로봇 마이크 → Claude → 동작', flush=True)
     if not key:
-        print('[API 키 미설정] PiCommandConfig.example.py를 PiCommandConfig.py로 복사한 뒤 키를 입력하세요.', flush=True)
+        print('[API 키 미설정] PiCommandCore.py 상단 CLAUDE_API_KEY에 키를 입력하고 서버를 다시 실행하세요.', flush=True)
     return service

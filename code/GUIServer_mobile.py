@@ -21,7 +21,9 @@ import Switch as switch
 from OLED_eyes import OLEDEyes
 from YOLO_detector import YOLODetector
 
-from PiVoiceLauncher import start_voice, voice_request
+from PiCommandService import start_command_service, handle_command_http
+
+command_service = None
 
 # =========================================================
 # CPU 부하 제한
@@ -46,8 +48,8 @@ except Exception:
 # =========================================================
 HOST = "0.0.0.0"
 WEB_PORT = 5000
-DRIVE_SPEED = 60
-TURN_SPEED = 50
+DRIVE_SPEED = 40
+TURN_SPEED = 30
 TURN_ANGLE = 30
 Dv = -1
 
@@ -298,7 +300,7 @@ def drive_command(motion, direction, steering_offset, speed):
         )
         apply_motion_lights(motion)
 
-def robot_ctrl(command, neck_seq=None):
+def _manual_robot_ctrl(command, neck_seq=None):
     if command.startswith("neck:"):
         if neck_controller is None:
             raise RuntimeError("목 제어기 초기화 전입니다")
@@ -373,6 +375,13 @@ def robot_ctrl(command, neck_seq=None):
         raise ValueError(
             f"알 수 없는 명령: {command}"
         )
+
+
+def robot_ctrl(*args, **kwargs):
+    if command_service is None:
+        return _manual_robot_ctrl(*args, **kwargs)
+    return command_service.manual(_manual_robot_ctrl, *args, **kwargs)
+
 
 # =========================================================
 # 카메라
@@ -1213,6 +1222,18 @@ body {
   #cameraFullscreenLayer .fs-joy-unit { gap: 3px; }
 }
 
+.ai-command-row{display:flex;gap:6px;margin-top:8px;align-items:stretch}
+.ai-command-row input{min-width:0;flex:1;padding:10px;border:1px solid #ccd1d8;border-radius:9px;font-size:16px}
+.ai-command-row button{border:0;border-radius:9px;padding:10px;background:#3182f6;color:white;font-weight:700}
+.ai-command-row button:disabled{opacity:.5}
+.ai-command-row .voice-button{width:auto;flex:1;padding:12px}
+#aiCommandCancel{background:#d9534f}
+.ai-command-progress{height:4px;overflow:hidden;background:#e5e8eb;border-radius:3px;margin-top:8px}
+.ai-command-progress:before{content:'';display:block;width:35%;height:100%;background:#3182f6;animation:aiWaiting 1.2s infinite ease-in-out}
+.ai-command-progress[hidden]{display:none}
+.ai-command-card .voice-text{max-height:none;overflow-wrap:anywhere;white-space:pre-wrap;font-size:12px}
+@keyframes aiWaiting{from{transform:translateX(-110%)}to{transform:translateX(390%)}}
+
 </style>
 </head>
 <body>
@@ -1383,12 +1404,19 @@ data-command="loose"
     </div>
     <div class="neck-note">버튼을 누르고 있는 동안 움직이며 손을 떼면 정지합니다.</div>
 </div>
-<div class="card voice-card">
-    <div class="card-title">🎤 한국어 음성 인식</div>
-    <button type="button" id="piVoiceButton" class="voice-button">🎤 누르고 말하기</button>
-    <div class="voice-hint">라즈베리파이에 연결한 ReSpeaker Lite로 녹음합니다.<br>누르고 있는 동안 녹음 · 놓으면 음성 인식</div>
-    <div class="voice-text" id="piVoiceStatus">음성 인식 준비 상태 확인 중...</div>
-    <div class="voice-text" id="piVoiceText"></div>
+<div class="card voice-card ai-command-card">
+  <div class="card-title">음성 / 텍스트 명령</div>
+  <form id="aiCommandForm" class="ai-command-row">
+    <input id="aiCommandText" type="text" maxlength="500" placeholder="에이 오른쪽으로 / 앞으로 가" autocomplete="off" aria-label="로봇 명령 입력">
+    <button id="aiCommandSend" type="submit">전송</button>
+  </form>
+  <div class="ai-command-row">
+    <button id="aiCommandVoice" type="button" class="voice-button">로봇 마이크 · 6초</button>
+    <button id="aiCommandCancel" type="button">AI 중지</button>
+  </div>
+  <div id="aiCommandStatus" class="voice-text" role="status" aria-live="polite">명령 서비스 연결 확인 중</div>
+  <div id="aiCommandProgress" class="ai-command-progress" hidden aria-label="명령 처리 중"></div>
+  <div id="aiCommandResult" class="voice-text"></div>
 </div>
 </div>
 <div class="footer">
@@ -1825,87 +1853,74 @@ async function loadStatus(){
 loadStatus();
 cameraWatchdog();
 
-/* VOICE_REPEAKER_1: use SAME ORIGIN proxy, never browser microphone permission */
 (function () {
-    const btn = document.getElementById('piVoiceButton');
-    if (!btn) return;
-    const status = document.getElementById('piVoiceStatus');
-    const output = document.getElementById('piVoiceText');
-    let held = false;
-    let sequence = Promise.resolve();
-    let lastResult = '';
-
-    function voiceAction(action) {
-        // Start and stop are serialized to avoid reversed requests on slow Wi-Fi.
-        sequence = sequence.catch(() => {}).then(async () => {
-            const response = await fetch('/api/voice/' + action, {
-                method:'POST', cache:'no-store', headers:{'Content-Type':'application/json'},
-                body:'{}', keepalive:true
-            });
-            if (!response.ok) throw new Error('HTTP ' + response.status);
-            return response.json();
-        }).catch(err => {
-            status.textContent = '마이크 명령 전송 오류: ' + err.message;
-        });
+  const form = document.getElementById('aiCommandForm');
+  const entry = document.getElementById('aiCommandText');
+  const send = document.getElementById('aiCommandSend');
+  const voice = document.getElementById('aiCommandVoice');
+  const cancel = document.getElementById('aiCommandCancel');
+  const status = document.getElementById('aiCommandStatus');
+  const result = document.getElementById('aiCommandResult');
+  const progress = document.getElementById('aiCommandProgress');
+  if (!form) return;
+  let requesting = false;
+  function render(data) {
+    const busy = !!data.busy;
+    send.disabled = busy || requesting;
+    voice.disabled = busy || requesting;
+    progress.hidden = !busy;
+    let label = data.message || data.error || '명령 입력 준비 완료';
+    if (data.state === 'recording') label = '지금 말하시오 · 남은 ' + Number(data.remaining || 0).toFixed(1) + '초';
+    if (data.state === 'analyzing') label = 'api 전달중';
+    if (data.error) label = data.error;
+    if (data.api_key_configured === false) label = '로봇의 PiCommandCore.py 상단 CLAUDE_API_KEY에 키를 입력하세요.';
+    status.textContent = label;
+    if (data.text) {
+      result.textContent = data.text + (data.command ? '\n' + data.command.reason : '');
     }
-    function start(e) {
-        if (e) e.preventDefault();
-        if (held) return;
-        held = true;
-        btn.classList.add('recording');
-        btn.textContent = '● 녹음 중 · 손을 떼면 인식';
-        voiceAction('start');
+  }
+  async function action(name, text) {
+    if (requesting && name !== 'cancel') return;
+    requesting = true;
+    status.textContent = name === 'voice' ? '마이크/모델 준비 중' : name === 'cancel' ? '중지 요청 중' : 'api 전달중';
+    send.disabled = voice.disabled = true;
+    try {
+      const response = await fetch('/api/ai/' + name, {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({text: text || ''}), cache: 'no-store'
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'HTTP ' + response.status);
+      requesting = false;
+      render(data);
+    } catch (error) {
+      requesting = false;
+      status.textContent = '요청 오류: ' + error.message;
+      send.disabled = voice.disabled = false;
+      progress.hidden = true;
     }
-    const voiceHeartbeat = setInterval(() => {
-        if (held) voiceAction('ping');
-    }, 650);
-    function end() {
-        if (!held) return;
-        held = false;
-        btn.classList.remove('recording');
-        btn.textContent = '🎤 누르고 말하기';
-        voiceAction('stop');
+  }
+  form.addEventListener('submit', event => {
+    event.preventDefault();
+    if (!send.disabled && entry.value.trim()) action('text', entry.value.trim());
+  });
+  voice.addEventListener('click', () => action('voice'));
+  cancel.addEventListener('click', () => action('cancel'));
+  async function poll() {
+    try {
+      const response = await fetch('/api/ai/status', {cache: 'no-store'});
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'HTTP ' + response.status);
+      if (!requesting) render(data);
+    } catch (error) {
+      status.textContent = '명령 서비스 연결 확인 중: ' + error.message;
+    } finally {
+      setTimeout(poll, 350);
     }
-    btn.addEventListener('pointerdown', e => {
-        start(e);
-        try { btn.setPointerCapture(e.pointerId); } catch (_) {}
-    });
-    for (const ev of ['pointerup','pointercancel','lostpointercapture']) {
-        btn.addEventListener(ev, end);
-    }
-    window.addEventListener('blur', end);
-    window.addEventListener('pagehide', end);
-    document.addEventListener('visibilitychange', () => {
-        if (document.hidden) end();
-    });
-
-    async function refreshVoice() {
-        try {
-            const response = await fetch('/api/voice/status', {cache:'no-store'});
-            if (!response.ok) throw new Error('HTTP ' + response.status);
-            const data = await response.json();
-            const names = {
-                loading:'음성 모델 준비 중', ready:'음성 인식 준비 완료',
-                opening:'마이크 연결 중', recording:'녹음 중',
-                processing:'한국어 인식 중', done:'음성 인식 완료',
-                error:'음성 오류', offline:'음성 서비스 오프라인'
-            };
-            status.textContent = names[data.state] || data.message || '연결 확인 중';
-            if (data.state === 'done' && data.text && data.text !== lastResult) {
-                lastResult = data.text;
-                output.textContent = '인식 결과: ' + data.text +
-                    (data.elapsed != null ? ' (' + data.elapsed + '초)' : '');
-            }
-            if (data.state === 'error' || data.state === 'offline') {
-                output.textContent = data.error || data.message || '마이크 연결 확인 필요';
-            }
-        } catch (err) {
-            status.textContent = '음성 서비스 연결 확인 중';
-        }
-    }
-    refreshVoice();
-    setInterval(refreshVoice, 650);
+  }
+  poll();
 })();
+
 
 
 /* SMOOTH_AB_INTEGRATION_v1 : neck joystick/button keepalive */
@@ -2264,8 +2279,7 @@ class MobileHandler(
     def do_GET(
         self
     ):
-        if self.path.split('?', 1)[0] == '/api/voice/status':
-            self.send_json(voice_request('status'))
+        if handle_command_http(self, command_service):
             return
         if (
             self.path == "/"
@@ -2414,14 +2428,7 @@ class MobileHandler(
     def do_POST(
         self
     ):
-        if self.path.split('?', 1)[0] in ('/api/voice/start', '/api/voice/stop', '/api/voice/ping'):
-            origin = self.headers.get('Origin')
-            local_origin = 'http://' + self.headers.get('Host', '')
-            if origin and origin != local_origin:
-                self.send_json({'state': 'error', 'error': '잘못된 접속 출처'}, status=403)
-                return
-            action = self.path.rsplit('/', 1)[-1]
-            self.send_json(voice_request(action))
+        if handle_command_http(self, command_service):
             return
         global last_move_seq
         if not self.path.startswith(
@@ -2551,6 +2558,7 @@ class MobileHTTPServer(
 # =========================================================
 
 def main():
+    global command_service
     global server_running
     global yolo_detector
     global async_yolo
@@ -2669,6 +2677,7 @@ def main():
         daemon=True,
         name="CameraThread"
     ).start()
+    command_service = start_command_service(globals())
     # HTTP 서버
     server = MobileHTTPServer(
         (
@@ -2696,6 +2705,7 @@ def main():
             "\n[서버] 종료 요청"
         )
     finally:
+        command_service.close()
         server_running = False
         with camera_condition:
             camera_condition.notify_all()
@@ -2741,5 +2751,4 @@ def main():
             "[서버] 종료 완료"
         )
 if __name__ == "__main__":
-    start_voice()  # VOICE_REPEAKER_1
     main()
