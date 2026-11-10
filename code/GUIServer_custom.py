@@ -40,6 +40,10 @@ import Switch as switch
 from OLED_eyes import OLEDEyes
 from YOLO_detector import YOLODetector
 
+from PiCommandService import start_command_service
+
+command_service = None
+
 
 # =========================================================
 # CPU 부하 제한
@@ -633,7 +637,7 @@ def drive_command(
 # 명령 처리
 # =========================================================
 
-def robot_ctrl(
+def _manual_robot_ctrl(
     command
 ):
 
@@ -845,6 +849,13 @@ def robot_ctrl(
         gripper_servo.moveServoInit(
             [4]
         )
+
+
+def robot_ctrl(*args, **kwargs):
+    if command_service is None:
+        return _manual_robot_ctrl(*args, **kwargs)
+    return command_service.manual(_manual_robot_ctrl, *args, **kwargs)
+
 
 
 # =========================================================
@@ -1268,7 +1279,6 @@ def handle_client(
 
     try:
 
-
         while True:
 
 
@@ -1428,6 +1438,8 @@ def handle_client(
 
 
     finally:
+        if command_service is not None:
+            command_service.cancel()
 
 
         camera_stop_event.set()
@@ -1461,6 +1473,7 @@ def handle_client(
 
 def main():
 
+    global command_service
     global oled_eyes
 
     global yolo_detector
@@ -1680,6 +1693,7 @@ def main():
 
     try:
 
+        command_service = start_command_service(globals())
 
         while True:
 
@@ -1709,6 +1723,8 @@ def main():
 
 
     finally:
+        if command_service is not None:
+            command_service.close()
 
 
         gripper_stop()

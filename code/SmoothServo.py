@@ -16,7 +16,7 @@ import time
 # Confirmed by the user's NeckTest.py; verify on the physical robot.
 NECK_CHANNELS = {"a_pan": 1, "a_tilt": 3, "b_tilt": 2}
 NECK_SIGNS = {"a_pan": 1, "a_tilt": 1, "b_tilt": 1}
-NECK_MAX_OFFSET = {"a_pan": 12, "a_tilt": 12, "b_tilt": 12}
+NECK_MAX_OFFSET = {"a_pan": 20, "a_tilt": 20, "b_tilt": 20}
 NECK_STEP = 1                 # degrees per hardware update
 NECK_TICK = 0.055            # nominal update interval (55 ms)
 NECK_COMMAND_TIMEOUT = 0.8   # automatic hold release if client disconnects
@@ -41,6 +41,7 @@ class SmoothNeck:
         self.deadline = {axis: 0.0 for axis in self.axes}
         self.last_seq = {axis: -1 for axis in self.axes}
         self.lock = threading.Lock()
+        self.io_lock = threading.RLock()
         self.stop_event = threading.Event()
         self.worker = None
         self.last_error = None
@@ -78,10 +79,20 @@ class SmoothNeck:
             self.deadline[axis] = time.monotonic() + NECK_COMMAND_TIMEOUT if direction else 0.0
 
     def release_all(self):
-        with self.lock:
-            for axis in self.axes:
-                self.direction[axis] = 0
-                self.deadline[axis] = 0.0
+        with self.io_lock:
+            with self.lock:
+                for axis in self.axes:
+                    self.direction[axis] = 0
+                    self.deadline[axis] = 0.0
+
+    def sync_pwm(self, axis, angle):
+        """AI 동작 후 수동 제어의 시작 위치를 마지막 PWM 위치와 맞춘다."""
+        channel = NECK_CHANNELS[axis]
+        with self.io_lock:
+            with self.lock:
+                self.position[axis] = angle - self.servo.initPos[channel]
+                for name in ('nowPos', 'lastPos', 'bufferPos', 'goalPos'):
+                    getattr(self.servo, name)[channel] = angle
 
     def _run(self):
         # An initial position is not commanded: avoid sudden motion at startup.
@@ -108,9 +119,14 @@ class SmoothNeck:
                     break
                 try:
                     # ServoCtrl.moveAngle takes an offset from init_pwm[channel].
-                    self.servo.moveAngle(NECK_CHANNELS[axis], next_pos)
-                    with self.lock:
-                        self.position[axis] = next_pos
+                    with self.io_lock:
+                        with self.lock:
+                            active = bool(self.direction[axis])
+                        if not active:
+                            continue
+                        self.servo.moveAngle(NECK_CHANNELS[axis], next_pos)
+                        with self.lock:
+                            self.position[axis] = next_pos
                     self.last_error = None
                 except Exception as exc:
                     self.last_error = repr(exc)
@@ -185,3 +201,4 @@ class SmoothGripper:
         self.release()
         if self.worker.is_alive():
             self.worker.join(timeout=1.0)
+

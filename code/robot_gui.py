@@ -33,6 +33,8 @@ import zmq
 from PIL import Image, ImageTk
 from fullscreen_gui import FullscreenGUI
 
+from PiCommandPanel import attach_command_panel
+
 # =========================================================
 # 서버 설정
 # =========================================================
@@ -616,6 +618,8 @@ def update_keyboard_movement():
         start_move(new_direction)
 
 def key_pressed(event):
+    if isinstance(event.widget, (tk.Entry, tk.Text, ttk.Entry, ttk.Combobox)):
+        return
     key = event.keysym.lower()
     if key in release_jobs:
         try:
@@ -656,6 +660,8 @@ def process_key_release(key):
         arm_stop()
 
 def key_released(event):
+    if isinstance(event.widget, (tk.Entry, tk.Text, ttk.Entry, ttk.Combobox)) and event.keysym.lower() not in pressed_keys:
+        return
     key = event.keysym.lower()
 
     # 키 반복 때문에 순간적으로 Release가 발생하는 것 방지
@@ -776,6 +782,17 @@ server_status.pack(side="left")
 # =========================================================
 # 카메라 영역
 # =========================================================
+
+def clear_for_text_input():
+    for job in list(release_jobs.values()):
+        window.after_cancel(job)
+    release_jobs.clear()
+    pressed_keys.clear()
+    stop_move()
+    arm_stop()
+
+
+attach_command_panel(window, header, server_ip=SERVER_IP, on_focus=clear_for_text_input)
 
 camera_row = tk.Frame(main, bg=BG)
 
@@ -1252,3 +1269,4 @@ try:
 
 except KeyboardInterrupt:
     close_program()
+
